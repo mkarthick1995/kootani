@@ -1,0 +1,16 @@
+node_modules/
+dist/
+out/
+build/
+release/
+.cache/
+.claude/
+*.log
+.env
+.env.local
+.DS_Store
+.vite/
+
+# Local secrets — never commit
+kootani.config.json
+client_secret_*.json
