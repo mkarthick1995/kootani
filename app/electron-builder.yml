@@ -1,0 +1,27 @@
+appId: com.kootani.app
+productName: Kootani
+
+directories:
+  output: release
+  buildResources: build
+
+# Main/preload have no third-party runtime deps (electron provides electron;
+# the renderer is bundled by vite), so we ship only the build output + manifest.
+files:
+  - out/**/*
+  - package.json
+
+# Bundle the config (Google creds + defaults) into resources/ so the packaged
+# app finds it via process.resourcesPath. Kept out of the asar for easy reading.
+extraResources:
+  - from: kootani.config.json
+    to: kootani.config.json
+
+win:
+  target:
+    - portable
+  # No code-signing cert (would cost money) — the .exe is unsigned. Friends will
+  # see a Windows SmartScreen prompt: "More info" → "Run anyway".
+
+portable:
+  artifactName: ${productName}-${version}-portable.${ext}
