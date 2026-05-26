@@ -10,6 +10,7 @@ release/
 .env.local
 .DS_Store
 .vite/
+*.tsbuildinfo
 
 # Local secrets — never commit
 kootani.config.json

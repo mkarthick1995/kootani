@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { UserInfo } from "@shared/protocol";
 import type { KootaniConfig } from "@shared/ipc";
-import { RoomClient, type RoomSnapshot } from "./lib/RoomClient";
+import { RoomClient, type MediaSettings, type RoomSnapshot } from "./lib/RoomClient";
 import { decodeJoinLink, encodeJoinLink, normalizeWsUrl } from "./lib/joinlink";
 import { RemoteAudio } from "./components/RemoteAudio";
 
@@ -256,6 +256,7 @@ function Room({
   onLeave: () => void;
 }): JSX.Element {
   const [copied, setCopied] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
   const joinLink = encodeJoinLink({ url: signalingUrl, room: snapshot.room });
 
   const copyLink = (): void => {
@@ -280,9 +281,17 @@ function Room({
             {snapshot.status === "error" && (snapshot.error ?? "Error")}
           </span>
         </div>
-        <button className="btn danger" onClick={onLeave}>
-          Leave
-        </button>
+        <div className="header-actions">
+          <button
+            className={`btn small ${showSettings ? "primary" : ""}`}
+            onClick={() => setShowSettings((s) => !s)}
+          >
+            ⚙ Audio
+          </button>
+          <button className="btn danger" onClick={onLeave}>
+            Leave
+          </button>
+        </div>
       </header>
 
       <div className="invite-bar">
@@ -298,6 +307,8 @@ function Room({
         </button>
       </div>
 
+      {showSettings && <AudioSettings settings={snapshot.settings} client={client} />}
+
       {snapshot.error && snapshot.status !== "error" && (
         <div className="banner">{snapshot.error}</div>
       )}
@@ -305,45 +316,125 @@ function Room({
       <ul className="peer-grid">
         {/* Self */}
         <li className="peer self">
-          <Avatar user={snapshot.self} />
-          <div className="peer-meta">
-            <span className="peer-name">
-              {snapshot.self.name} <em>(you)</em>
-            </span>
-            <span className="badges">
-              {snapshot.isSelfHost && <span className="badge host">HOST</span>}
-              {snapshot.muted && <span className="badge muted">MUTED</span>}
-            </span>
+          <div className="peer-row">
+            <Avatar user={snapshot.self} />
+            <div className="peer-meta">
+              <span className="peer-name">
+                {snapshot.self.name} <em>(you)</em>
+              </span>
+              <span className="badges">
+                {snapshot.isSelfHost && <span className="badge host">HOST</span>}
+                {snapshot.muted && <span className="badge muted">MUTED</span>}
+              </span>
+            </div>
+            <button
+              className={`btn ${snapshot.muted ? "" : "primary"}`}
+              onClick={() => client.setMuted(!snapshot.muted)}
+            >
+              {snapshot.muted ? "Unmute" : "Mute"}
+            </button>
           </div>
-          <button
-            className={`btn ${snapshot.muted ? "" : "primary"}`}
-            onClick={() => client.setMuted(!snapshot.muted)}
-          >
-            {snapshot.muted ? "Unmute" : "Mute"}
-          </button>
         </li>
 
         {/* Peers */}
         {snapshot.peers.map((peer) => (
           <li className="peer" key={peer.id}>
-            <Avatar user={peer.user} />
-            <div className="peer-meta">
-              <span className="peer-name">{peer.user.name}</span>
-              <span className="badges">
-                {peer.isHost && <span className="badge host">HOST</span>}
-                <span className={`conn ${peer.connection}`}>{peer.connection}</span>
-              </span>
+            <div className="peer-row">
+              <Avatar user={peer.user} />
+              <div className="peer-meta">
+                <span className="peer-name">{peer.user.name}</span>
+                <span className="badges">
+                  {peer.isHost && <span className="badge host">HOST</span>}
+                  <span className={`conn ${peer.connection}`}>{peer.connection}</span>
+                </span>
+              </div>
+              {snapshot.isSelfHost && !peer.isHost && (
+                <button className="btn small" onClick={() => client.transferHostTo(peer.id)}>
+                  Make host
+                </button>
+              )}
             </div>
-            {snapshot.isSelfHost && !peer.isHost && (
-              <button className="btn small" onClick={() => client.transferHostTo(peer.id)}>
-                Make host
-              </button>
-            )}
-            <RemoteAudio stream={peer.stream} />
+            <div className="peer-volume">
+              <span className="vol-icon">🔊</span>
+              <input
+                type="range"
+                min={0}
+                max={1}
+                step={0.05}
+                value={peer.outputVolume}
+                onChange={(e) => client.setPeerVolume(peer.id, Number(e.target.value))}
+              />
+              <span className="slider-val">{Math.round(peer.outputVolume * 100)}%</span>
+            </div>
+            <RemoteAudio stream={peer.stream} volume={peer.outputVolume} />
           </li>
         ))}
       </ul>
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+
+function AudioSettings({
+  settings,
+  client,
+}: {
+  settings: MediaSettings;
+  client: RoomClient;
+}): JSX.Element {
+  return (
+    <div className="settings-panel">
+      <div className="settings-title">
+        Your microphone <span className="hint-inline">— these only affect you</span>
+      </div>
+      <div className="settings-grid">
+        <Toggle
+          label="Echo cancellation"
+          checked={settings.echoCancellation}
+          onChange={(v) => client.setEchoCancellation(v)}
+        />
+        <Toggle
+          label="Noise suppression"
+          checked={settings.noiseSuppression}
+          onChange={(v) => client.setNoiseSuppression(v)}
+        />
+        <Toggle
+          label="Auto gain"
+          checked={settings.autoGainControl}
+          onChange={(v) => client.setAutoGainControl(v)}
+        />
+      </div>
+      <div className="slider-row">
+        <span className="slider-label">Input volume</span>
+        <input
+          type="range"
+          min={0}
+          max={2}
+          step={0.05}
+          value={settings.inputVolume}
+          onChange={(e) => client.setInputVolume(Number(e.target.value))}
+        />
+        <span className="slider-val">{Math.round(settings.inputVolume * 100)}%</span>
+      </div>
+    </div>
+  );
+}
+
+function Toggle({
+  label,
+  checked,
+  onChange,
+}: {
+  label: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+}): JSX.Element {
+  return (
+    <label className="toggle-row">
+      <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} />
+      <span>{label}</span>
+    </label>
   );
 }
 

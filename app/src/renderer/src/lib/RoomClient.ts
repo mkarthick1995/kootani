@@ -33,6 +33,45 @@ export const ICE_SERVERS: RTCIceServer[] = [
 
 export type RoomStatus = "connecting" | "connected" | "closed" | "error";
 
+/** Per-user microphone settings. Persisted in localStorage across sessions. */
+export interface MediaSettings {
+  echoCancellation: boolean;
+  noiseSuppression: boolean;
+  autoGainControl: boolean;
+  /** Mic gain multiplier applied via a Web Audio GainNode. 1 = unchanged. */
+  inputVolume: number;
+}
+
+const SETTINGS_KEY = "kootani.audioSettings";
+const DEFAULT_SETTINGS: MediaSettings = {
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: true,
+  inputVolume: 1,
+};
+
+function loadSettings(): MediaSettings {
+  try {
+    const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? "") as Partial<MediaSettings>;
+    return {
+      echoCancellation: s.echoCancellation ?? DEFAULT_SETTINGS.echoCancellation,
+      noiseSuppression: s.noiseSuppression ?? DEFAULT_SETTINGS.noiseSuppression,
+      autoGainControl: s.autoGainControl ?? DEFAULT_SETTINGS.autoGainControl,
+      inputVolume: typeof s.inputVolume === "number" ? s.inputVolume : DEFAULT_SETTINGS.inputVolume,
+    };
+  } catch {
+    return { ...DEFAULT_SETTINGS };
+  }
+}
+
+function saveSettings(s: MediaSettings): void {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+  } catch {
+    /* storage may be unavailable; settings just won't persist */
+  }
+}
+
 export interface PeerView {
   id: string;
   user: UserInfo;
@@ -40,6 +79,8 @@ export interface PeerView {
   /** Remote audio (and later video) stream, once negotiated. */
   stream: MediaStream | null;
   connection: RTCPeerConnectionState;
+  /** How loudly *this* user hears the peer (0–1). Local-only. */
+  outputVolume: number;
 }
 
 export interface RoomSnapshot {
@@ -50,6 +91,7 @@ export interface RoomSnapshot {
   self: UserInfo;
   isSelfHost: boolean;
   muted: boolean;
+  settings: MediaSettings;
   peers: PeerView[];
   error: string | null;
 }
@@ -60,6 +102,7 @@ interface PeerState {
   stream: MediaStream | null;
   connection: RTCPeerConnectionState;
   pendingCandidates: RTCIceCandidateInit[];
+  outputVolume: number;
 }
 
 export interface RoomClientOptions {
@@ -74,6 +117,12 @@ export class RoomClient {
   private localStream: MediaStream | null = null;
   private readonly peers = new Map<string, PeerState>();
 
+  // Mic capture pipeline: raw mic track -> GainNode (input volume) -> output.
+  private rawTrack: MediaStreamTrack | null = null;
+  private audioCtx: AudioContext | null = null;
+  private gainNode: GainNode | null = null;
+  private settings: MediaSettings = loadSettings();
+
   private status: RoomStatus = "connecting";
   private selfId: string | null = null;
   private hostId: string | null = null;
@@ -85,11 +134,37 @@ export class RoomClient {
   // -- lifecycle ------------------------------------------------------------
 
   async connect(): Promise<void> {
+    let raw: MediaStream;
     try {
-      this.localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      raw = await navigator.mediaDevices.getUserMedia({
+        // The voice DSP: echo cancellation stops a peer on speakers from looping
+        // our voice back; noise suppression + auto gain clean up the signal.
+        // These start from the user's saved preferences and stay toggleable live.
+        audio: {
+          echoCancellation: this.settings.echoCancellation,
+          noiseSuppression: this.settings.noiseSuppression,
+          autoGainControl: this.settings.autoGainControl,
+        },
+      });
     } catch {
       this.fail("Couldn't access your microphone. Check Windows mic permissions.");
       return;
+    }
+    this.rawTrack = raw.getAudioTracks()[0] ?? null;
+
+    // Route the mic through a GainNode so input volume is adjustable, then send
+    // the processed stream to peers. Falls back to the raw mic if Web Audio fails.
+    try {
+      this.audioCtx = new AudioContext();
+      void this.audioCtx.resume();
+      const source = this.audioCtx.createMediaStreamSource(raw);
+      this.gainNode = this.audioCtx.createGain();
+      this.gainNode.gain.value = this.settings.inputVolume;
+      const dest = this.audioCtx.createMediaStreamDestination();
+      source.connect(this.gainNode).connect(dest);
+      this.localStream = dest.stream;
+    } catch {
+      this.localStream = raw;
     }
 
     const ws = new WebSocket(this.opts.signalingUrl);
@@ -113,7 +188,12 @@ export class RoomClient {
     for (const p of this.peers.values()) p.pc.close();
     this.peers.clear();
     this.localStream?.getTracks().forEach((t) => t.stop());
+    this.rawTrack?.stop();
+    this.rawTrack = null;
     this.localStream = null;
+    void this.audioCtx?.close();
+    this.audioCtx = null;
+    this.gainNode = null;
     this.ws?.close();
     this.ws = null;
     this.status = "closed";
@@ -130,6 +210,52 @@ export class RoomClient {
 
   transferHostTo(peerId: string): void {
     this.send({ type: "transfer-host", to: peerId });
+  }
+
+  // -- audio controls (all local to this user) ------------------------------
+
+  setEchoCancellation(on: boolean): void {
+    this.settings.echoCancellation = on;
+    this.applyMicSettings();
+  }
+
+  setNoiseSuppression(on: boolean): void {
+    this.settings.noiseSuppression = on;
+    this.applyMicSettings();
+  }
+
+  setAutoGainControl(on: boolean): void {
+    this.settings.autoGainControl = on;
+    this.applyMicSettings();
+  }
+
+  /** Mic input gain. 0 = silence, 1 = unchanged, >1 amplifies. */
+  setInputVolume(value: number): void {
+    this.settings.inputVolume = value;
+    if (this.gainNode) this.gainNode.gain.value = value;
+    saveSettings(this.settings);
+    this.emit();
+  }
+
+  /** How loudly this user hears one peer (0–1). Doesn't affect anyone else. */
+  setPeerVolume(peerId: string, value: number): void {
+    const ps = this.peers.get(peerId);
+    if (!ps) return;
+    ps.outputVolume = value;
+    this.emit();
+  }
+
+  /** Re-apply the DSP toggles to the live mic track without renegotiating. */
+  private applyMicSettings(): void {
+    void this.rawTrack
+      ?.applyConstraints({
+        echoCancellation: this.settings.echoCancellation,
+        noiseSuppression: this.settings.noiseSuppression,
+        autoGainControl: this.settings.autoGainControl,
+      })
+      .catch(() => {});
+    saveSettings(this.settings);
+    this.emit();
   }
 
   // -- signaling ------------------------------------------------------------
@@ -198,7 +324,7 @@ export class RoomClient {
     }
 
     const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-    ps = { info, pc, stream: null, connection: "new", pendingCandidates: [] };
+    ps = { info, pc, stream: null, connection: "new", pendingCandidates: [], outputVolume: 1 };
     this.peers.set(info.id, ps);
 
     this.localStream?.getTracks().forEach((t) => pc.addTrack(t, this.localStream!));
@@ -221,7 +347,24 @@ export class RoomClient {
   private async makeOffer(ps: PeerState): Promise<void> {
     const offer = await ps.pc.createOffer();
     await ps.pc.setLocalDescription(offer);
+    await this.tuneAudioBitrate(ps.pc);
     this.sendSignal(ps.info.id, { kind: "sdp", description: offer });
+  }
+
+  /** Raise the Opus bitrate for clearer voice (default is ~32 kbps). */
+  private async tuneAudioBitrate(pc: RTCPeerConnection): Promise<void> {
+    const sender = pc.getSenders().find((s) => s.track?.kind === "audio");
+    if (!sender) return;
+    try {
+      const params = sender.getParameters();
+      if (!params.encodings || params.encodings.length === 0) {
+        params.encodings = [{}];
+      }
+      params.encodings[0].maxBitrate = 64_000;
+      await sender.setParameters(params);
+    } catch {
+      // setParameters isn't supported everywhere; quality just falls back.
+    }
   }
 
   private async onSignal(from: string, data: SignalData): Promise<void> {
@@ -244,6 +387,7 @@ export class RoomClient {
     if (desc.type === "offer") {
       const answer = await ps.pc.createAnswer();
       await ps.pc.setLocalDescription(answer);
+      await this.tuneAudioBitrate(ps.pc);
       this.sendSignal(from, { kind: "sdp", description: answer });
     }
   }
@@ -274,6 +418,7 @@ export class RoomClient {
       isHost: p.info.id === this.hostId,
       stream: p.stream,
       connection: p.connection,
+      outputVolume: p.outputVolume,
     }));
 
     return {
@@ -284,6 +429,7 @@ export class RoomClient {
       self: this.opts.user,
       isSelfHost: this.selfId !== null && this.selfId === this.hostId,
       muted: this.muted,
+      settings: { ...this.settings },
       peers,
       error: this.error,
     };
