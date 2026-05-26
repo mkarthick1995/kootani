@@ -8,7 +8,7 @@
 import { join } from "node:path";
 import { app } from "electron";
 import { createSignalingServer, type SignalingHandle } from "./signaling.js";
-import { ensureCloudflared, startTunnel, type Tunnel } from "./cloudflared.js";
+import { ensureCloudflared, startTunnel, waitUntilRoutable, type Tunnel } from "./cloudflared.js";
 
 interface ActiveHost {
   server: SignalingHandle;
@@ -27,19 +27,26 @@ export async function startHosting(onStatus?: (status: string) => void): Promise
 
   onStatus?.("Starting local server…");
   const server = await createSignalingServer(0);
+  let tunnel: Tunnel | null = null;
 
   try {
     onStatus?.("Preparing the tunnel (first run downloads a small helper)…");
     const bin = await ensureCloudflared(join(app.getPath("userData"), "bin"));
 
     onStatus?.("Opening a secure tunnel…");
-    const tunnel = await startTunnel(bin, server.port);
+    tunnel = await startTunnel(bin, server.port);
+
+    // cloudflared says "registered" before the edge actually routes — wait until
+    // the tunnel truly serves traffic so the UI never connects to a dead URL.
+    onStatus?.("Waiting for the tunnel to come online…");
+    await waitUntilRoutable(tunnel.url);
 
     active = { server, tunnel };
     onStatus?.("Live");
     return { url: tunnel.url };
   } catch (err) {
-    // Don't leave a dangling server if the tunnel failed.
+    // Don't leave a dangling tunnel/server if anything failed.
+    tunnel?.stop();
     await server.close();
     throw err;
   }

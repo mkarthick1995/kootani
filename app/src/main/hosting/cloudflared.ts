@@ -13,6 +13,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { arch, platform } from "node:os";
+import { get as httpsGet } from "node:https";
 
 function cloudflaredAsset(): { name: string; file: string } {
   const a = arch() === "arm64" ? "arm64" : "amd64";
@@ -124,5 +125,52 @@ export function startTunnel(bin: string, port: number, onLog?: (line: string) =>
     child.stderr?.on("data", scan); // cloudflared prints the URL to stderr
     child.on("error", (err) => finishErr(err));
     child.on("exit", (code) => finishErr(new Error(`The tunnel helper exited unexpectedly (code ${code ?? "?"}).`)));
+  });
+}
+
+const ROUTABLE_TIMEOUT_MS = 45_000;
+const ROUTABLE_POLL_MS = 1_500;
+
+/**
+ * cloudflared reports a connection "registered" before Cloudflare's edge has
+ * actually published a route to it — so a client that connects immediately gets
+ * a refused/reset socket (WebSocket close code 1006). This polls the tunnel's
+ * own /health endpoint until it genuinely serves the local server, so we only
+ * hand the URL to the UI once it's truly usable. Rejects after a timeout.
+ */
+export function waitUntilRoutable(wssUrl: string, onLog?: (line: string) => void): Promise<void> {
+  const healthUrl = wssUrl.replace(/^wss:/, "https:") + "/health";
+  const deadline = Date.now() + ROUTABLE_TIMEOUT_MS;
+
+  return new Promise<void>((resolve, reject) => {
+    let tries = 0;
+
+    const attempt = (): void => {
+      tries++;
+      const req = httpsGet(healthUrl, { timeout: 6000 }, (res) => {
+        let body = "";
+        res.on("data", (d) => (body += d));
+        res.on("end", () => {
+          if (res.statusCode === 200 && body.includes("Kootani")) resolve();
+          else retry(`status ${res.statusCode}`);
+        });
+      });
+      req.on("error", (e) => retry(e.message));
+      req.on("timeout", () => {
+        req.destroy();
+        retry("request timeout");
+      });
+    };
+
+    const retry = (why: string): void => {
+      if (Date.now() >= deadline) {
+        reject(new Error("The tunnel didn't come online in time. Please try hosting again."));
+        return;
+      }
+      onLog?.(`tunnel not routable yet (try ${tries}: ${why})`);
+      setTimeout(attempt, ROUTABLE_POLL_MS);
+    };
+
+    attempt();
   });
 }
