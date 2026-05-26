@@ -2,6 +2,7 @@ import { join } from "node:path";
 import { app, BrowserWindow, clipboard, ipcMain, session, shell } from "electron";
 import { googleLogin } from "./auth.js";
 import { loadConfig, type AppConfig } from "./config.js";
+import { startHosting, stopHosting } from "./hosting/index.js";
 import type { UserInfo } from "../shared/protocol.js";
 
 // Resolved once the app is ready (loadConfig reads app.getAppPath()).
@@ -68,6 +69,16 @@ app.whenReady().then(() => {
     }
     return googleLogin(config.googleClientId, config.googleClientSecret);
   });
+
+  // One-click hosting: spin up the signaling server + tunnel, streaming progress
+  // back to the renderer so it can show "Opening tunnel…" etc.
+  ipcMain.handle("host:start", (event) => {
+    const sender = event.sender;
+    return startHosting((status) => {
+      if (!sender.isDestroyed()) sender.send("host:status", status);
+    });
+  });
+  ipcMain.handle("host:stop", () => stopHosting());
 
   createWindow();
 

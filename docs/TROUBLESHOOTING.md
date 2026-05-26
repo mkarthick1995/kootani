@@ -5,28 +5,48 @@ roughly by how often they bite.
 
 ---
 
+## "Host a new room" hangs or errors
+
+One-click hosting starts a local server and opens a Cloudflare tunnel. If it gets
+stuck on "Opening a secure tunnel…" or shows an error:
+
+- **First run downloads `cloudflared`** (~30 MB) from GitHub. On a slow or blocked
+  connection this can stall. Make sure GitHub releases are reachable, then try
+  again (the download is cached after the first success).
+- **Antivirus / SmartScreen may quarantine `cloudflared.exe`.** It's downloaded to
+  `%APPDATA%\kootani\bin\`. Allow it if your AV flags it, then retry.
+- **"The tunnel took too long to come up."** Usually transient — just click **Host
+  a new room** again. If it persists, your network may block outbound QUIC/HTTPS to
+  Cloudflare.
+- Need a server you control instead? Use the lobby's **Advanced → custom server
+  address** with `npm run host` (see below).
+
+---
+
 ## "Couldn't reach the signaling server"
 
-The app couldn't open a WebSocket to the address it was given. Two causes:
+The app couldn't open a WebSocket to the address it was given. With one-click
+hosting the address is handled for you, so this almost always means the **Advanced
+(custom server address)** path:
 
 **1. No server is running at that address.**
-- Hosting locally? Start it: `npm run dev:server` (or `npm run host`).
+- Start one: `npm run host` (server + tunnel), or `npm run dev:server` for local.
 - The server and the app are **separate processes**. The server terminal just
   sits showing "listening…" — that's correct; leave it open.
 
-**2. The invite link points at `localhost` (most common in real tests).**
-- If you host with the **default** "Your server address" (`ws://localhost:8787`),
-  the invite link tells your friend's PC to connect to *its own* localhost —
-  where nothing is running. It works between two windows on your machine but
-  **fails for anyone remote.**
-- Fix: run `npm run host`, paste the printed `wss://….trycloudflare.com` address
-  into "Your server address", host, then share that invite link.
+**2. The address points at `localhost`.**
+- A custom address of `ws://localhost:8787` tells your friend's PC to connect to
+  *its own* localhost — where nothing is running. It works between two windows on
+  your machine but **fails for anyone remote.** Use the `wss://….trycloudflare.com`
+  address from `npm run host`, or just use one-click hosting, which never has this
+  problem.
 
 ---
 
 ## `Error: listen EADDRINUSE: address already in use :::8787`
 
-Something is already on port 8787.
+Only affects the **standalone** server (`npm run host` / `npm run dev:server`) —
+one-click hosting uses an OS-assigned port and can't collide.
 
 - You're probably running **both** `npm run dev:server` and `npm run host`.
   `npm run host` starts its own server — use one or the other, not both.
@@ -36,7 +56,7 @@ Something is already on port 8787.
   ```
 - Or run on another port: `$env:PORT = "8790"; npm run host`.
 
-The server now prints a friendly hint for this instead of a raw stack trace.
+The server prints a friendly hint for this instead of a raw stack trace.
 
 ---
 
@@ -117,7 +137,8 @@ that value to match.
 
 ## The tunnel URL stopped working
 
-Free Cloudflare quick-tunnel URLs are **random per run** and disappear when you
-`Ctrl+C` the `npm run host` window. If you restarted hosting, the old invite link
-is dead — host again and share the **new** link. (A permanent URL would require a
-paid domain + named tunnel.)
+Free Cloudflare quick-tunnel URLs are **random per session** and disappear when
+hosting stops — i.e. when the host **leaves the room or quits the app** (or
+`Ctrl+C`s `npm run host`, on the standalone path). If you restarted hosting, the
+old invite link is dead — host again and share the **new** link. (A permanent URL
+would require a paid domain + named tunnel.)

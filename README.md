@@ -13,6 +13,8 @@ manage, no servers to rent, no cost.
 ## Features
 
 - 🎙️ **Live group voice** over WebRTC (peer-to-peer mesh, low latency).
+- 🖱️ **One-click hosting** — "Host a new room" turns your PC into the backend
+  automatically (signaling server + secure tunnel); no setup, no terminal.
 - 🌍 **Works across the internet** — friends in different countries, no VPN, no
   port-forwarding, via a free Cloudflare tunnel.
 - 🔑 **Google (Gmail) sign-in**, with a nickname fallback for quick testing.
@@ -30,11 +32,11 @@ manage, no servers to rent, no cost.
 ## How it works (in one picture)
 
 ```
-        YOUR PC (host, on demand)                         A FRIEND, anywhere
+        YOUR PC (host — one click)                        A FRIEND, anywhere
  ┌───────────────────────────────────┐
- │  signaling server  (server/)       │◄── wss://xxx.trycloudflare.com ──► Kootani.exe
- │  + cloudflared tunnel  (npm run    │◄──────────────────────────────────► Kootani.exe
- │    host)                           │
+ │  signaling server (in the app)     │◄── wss://xxx.trycloudflare.com ──► Kootani.exe
+ │  + cloudflared tunnel (auto)       │◄──────────────────────────────────► Kootani.exe
+ │                                    │
  └───────────────────────────────────┘
                    ▲
         voice is peer-to-peer (WebRTC) ── it does NOT flow through your PC or the cloud
@@ -42,11 +44,13 @@ manage, no servers to rent, no cost.
 
 Three pieces:
 
-1. **The client** (`app/`) — an Electron app. UI, WebRTC, sign-in.
-2. **The signaling server** (`server/`) — a tiny WebSocket service that helps
-   peers find each other and exchange connection info. It never carries audio.
-3. **The tunnel** (`cloudflared`, launched by `npm run host`) — exposes the
-   signaling server on your PC to the internet, free, with no router changes.
+1. **The client** (`app/`) — an Electron app. UI, WebRTC, sign-in. When you host,
+   it also runs the two pieces below for you.
+2. **The signaling server** — a tiny WebSocket service that helps peers find each
+   other and exchange connection info. It never carries audio. Hosting runs it
+   in-app; there's also a standalone copy in `server/` for development.
+3. **The tunnel** (`cloudflared`) — exposes the signaling server on your PC to the
+   internet, free, with no router changes. The app starts it automatically.
 
 "Host is the server" is true in two senses: the signaling server literally runs
 on the host's PC, **and** the host owns the room. The audio itself is direct
@@ -57,8 +61,8 @@ for the full design.
 
 ## Requirements
 
-- **To develop / host:** [Node.js](https://nodejs.org/) 18+ (tested on 22) and Windows.
-- **To just join as a friend:** nothing — only the `.exe`.
+- **To play (host *or* join):** nothing but the `.exe` — hosting is built in.
+- **To develop / build:** [Node.js](https://nodejs.org/) 18+ (tested on 22) and Windows.
 
 ---
 
@@ -85,30 +89,26 @@ You can sign in with a **nickname** immediately; Google sign-in needs setup (bel
 ## Playing with friends across the internet (free)
 
 Your PC becomes the backend on demand, exposed by a free Cloudflare quick tunnel
-— no account, no credit card, no router config.
+— no account, no credit card, no router config. It's one click:
 
-```powershell
-npm run host
-```
-
-This downloads `cloudflared` (first run only), starts the signaling server, opens
-the tunnel, and prints a public address like `wss://random-words.trycloudflare.com`.
-Then:
-
-1. In the app, paste that address into **"Your server address"** → **Host a new room**.
-2. Click **Copy** on the invite link and send it to your friends.
+1. **Host a new room.** The app starts the signaling server and opens a secure
+   tunnel for you. (The first time, it downloads a small helper, `cloudflared` —
+   a few seconds.)
+2. **Copy** the invite link and send it to your friends.
 3. Friends paste it into **"Join a friend's room"** in their copy of the app.
 
-Keep the `npm run host` window open while you play; `Ctrl+C` ends the session.
-
-> **Don't also run `npm run dev:server`** alongside `npm run host` — the launcher
-> starts its own server, and two would collide on port 8787.
->
-> The tunnel address is **random and changes each run** (a fixed one needs a paid
-> domain), so you share a fresh invite link each session.
+Keep the app open while you play; leaving the room or quitting shuts the tunnel
+down. The tunnel address is **random each session**, so you share a fresh invite
+link each time.
 
 See **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** if a friend can't connect
 or there's no audio.
+
+> **Advanced — bring your own server.** In the lobby, expand *“Advanced: use a
+> custom server address”* to point Kootani at a server you run yourself. For that,
+> `npm run host` starts the standalone signaling server + tunnel from a terminal
+> and prints a `wss://…` address to paste in. Useful for development or a
+> longer-lived server; not needed for normal play.
 
 ---
 
@@ -173,7 +173,8 @@ kootani/
 │   │   ├── main/                main process
 │   │   │   ├── index.ts         window, permissions, IPC, config
 │   │   │   ├── auth.ts          Google OAuth (system browser + PKCE)
-│   │   │   └── config.ts        config loader
+│   │   │   ├── config.ts        config loader
+│   │   │   └── hosting/         one-click hosting: embedded server + tunnel
 │   │   ├── preload/index.ts     contextBridge → window.kootani
 │   │   ├── renderer/            React UI
 │   │   │   └── src/
@@ -199,7 +200,7 @@ kootani/
 | --- | --- |
 | `npm run dev:server` | Run the signaling server with hot reload (`:8787`) |
 | `npm run dev:app` | Run the Electron app with hot reload |
-| `npm run host` | Start server + Cloudflare tunnel, print the public address |
+| `npm run host` | Standalone server + Cloudflare tunnel (optional — in-app hosting is one click) |
 | `npm run build:app` | Build the app bundle (no packaging) |
 | `npm run dist:app` | Build + package the portable `.exe` |
 | `npm run typecheck` | Typecheck both workspaces |
@@ -222,7 +223,7 @@ kootani/
 - ✅ Run-on-your-PC backend via free tunnel + invite links.
 - ✅ Portable `.exe` packaging.
 - ✅ Per-user audio controls (echo/noise/gain/volumes), persisted.
-- ⏭️ **One-click hosting** — embed the server + tunnel into the app (no `npm run host`).
+- ✅ **One-click hosting** — server + tunnel embedded in the app (no `npm run host`).
 - ⏭️ **TURN relay** — add a free relay for the minority of networks where direct
   peer-to-peer fails.
 - ⏸️ **Video sharing** — after voice is proven across the group.

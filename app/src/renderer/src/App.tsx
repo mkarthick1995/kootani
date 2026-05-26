@@ -20,6 +20,9 @@ export function App(): JSX.Element {
   const [signalingUrl, setSignalingUrl] = useState("");
   const [snapshot, setSnapshot] = useState<RoomSnapshot | null>(null);
   const clientRef = useRef<RoomClient | null>(null);
+  // True when this PC is running the signaling server/tunnel for the session,
+  // so leaving the room must also tear those down.
+  const selfHostedRef = useRef(false);
 
   useEffect(() => {
     window.kootani.getConfig().then((c) => {
@@ -29,10 +32,11 @@ export function App(): JSX.Element {
   }, []);
 
   const enterRoom = useCallback(
-    (room: string, url: string) => {
+    (room: string, url: string, selfHosted = false) => {
       if (!user) return;
       const normalized = normalizeWsUrl(url);
       setSignalingUrl(normalized);
+      selfHostedRef.current = selfHosted;
       const client = new RoomClient({
         signalingUrl: normalized,
         room,
@@ -50,6 +54,10 @@ export function App(): JSX.Element {
     clientRef.current?.leave();
     clientRef.current = null;
     setSnapshot(null);
+    if (selfHostedRef.current) {
+      selfHostedRef.current = false;
+      void window.kootani.stopHosting();
+    }
   }, []);
 
   const phase: Phase = !user ? "login" : snapshot ? "room" : "lobby";
@@ -159,12 +167,18 @@ function Lobby({
 }: {
   user: UserInfo;
   defaultUrl: string;
-  onEnter: (room: string, url: string) => void;
+  onEnter: (room: string, url: string, selfHosted?: boolean) => void;
   onSignOut: () => void;
 }): JSX.Element {
   const [link, setLink] = useState("");
-  const [serverUrl, setServerUrl] = useState(defaultUrl);
   const [linkError, setLinkError] = useState<string | null>(null);
+
+  const [hosting, setHosting] = useState(false);
+  const [hostStatus, setHostStatus] = useState("");
+  const [hostError, setHostError] = useState<string | null>(null);
+
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [serverUrl, setServerUrl] = useState(defaultUrl);
 
   const joinByLink = (): void => {
     const target = decodeJoinLink(link);
@@ -172,12 +186,30 @@ function Lobby({
       const looksLikeRoomCode = /^[a-z0-9]{4,10}$/i.test(link.trim());
       setLinkError(
         looksLikeRoomCode
-          ? "That's the room code, not the join link. Ask the host to click “Copy join link” and paste the whole thing here."
+          ? "That's the room code, not the join link. Ask the host to click “Copy link” and paste the whole thing here."
           : "That doesn't look like a valid join link.",
       );
       return;
     }
     onEnter(target.room, target.url);
+  };
+
+  // One click: the app starts the signaling server + tunnel for you, then hosts.
+  const hostOneClick = async (): Promise<void> => {
+    setHosting(true);
+    setHostError(null);
+    setHostStatus("Starting…");
+    const unsubscribe = window.kootani.onHostStatus(setHostStatus);
+    try {
+      const { url } = await window.kootani.startHosting();
+      onEnter(randomRoomCode(), url, true); // navigates away on success
+    } catch (e) {
+      setHostError(e instanceof Error ? e.message : "Couldn't start hosting.");
+      void window.kootani.stopHosting();
+      setHosting(false);
+    } finally {
+      unsubscribe();
+    }
   };
 
   const isLocal = /localhost|127\.0\.0\.1/.test(serverUrl);
@@ -203,8 +235,9 @@ function Lobby({
               setLink(e.target.value);
               setLinkError(null);
             }}
+            disabled={hosting}
           />
-          <button className="btn" type="submit" disabled={!link.trim()}>
+          <button className="btn" type="submit" disabled={!link.trim() || hosting}>
             Join
           </button>
         </form>
@@ -214,27 +247,57 @@ function Lobby({
           <span>or host your own</span>
         </div>
 
-        <label className="field-label">
-          Your server address{" "}
-          <span className="hint-inline">
-            {isLocal ? "(default — local testing only)" : "(from “npm run host”)"}
-          </span>
-        </label>
-        <input
-          className="input"
-          value={serverUrl}
-          onChange={(e) => setServerUrl(e.target.value)}
-          placeholder="wss://something.trycloudflare.com"
-        />
-        <button
-          className="btn primary big"
-          onClick={() => onEnter(randomRoomCode(), serverUrl)}
-          disabled={!serverUrl.trim()}
-        >
-          Host a new room
+        <button className="btn primary big" onClick={hostOneClick} disabled={hosting}>
+          {hosting ? "Setting up…" : "Host a new room"}
         </button>
+        {hosting && (
+          <p className="host-status">
+            <span className="spinner" /> {hostStatus}
+          </p>
+        )}
+        {!hosting && (
+          <p className="hint">
+            Your PC becomes the server and a secure link is created automatically —
+            no setup, free.
+          </p>
+        )}
+        {hostError && <p className="error">{hostError}</p>}
 
-        <button className="link" onClick={onSignOut}>
+        {!hosting && (
+          <>
+            <button
+              className="link advanced-toggle"
+              onClick={() => setShowAdvanced((s) => !s)}
+            >
+              {showAdvanced ? "▾ " : "▸ "}Advanced: use a custom server address
+            </button>
+            {showAdvanced && (
+              <div className="advanced">
+                <label className="field-label">
+                  Server address{" "}
+                  <span className="hint-inline">
+                    {isLocal ? "(local — for testing on this PC)" : "(e.g. from “npm run host”)"}
+                  </span>
+                </label>
+                <input
+                  className="input"
+                  value={serverUrl}
+                  onChange={(e) => setServerUrl(e.target.value)}
+                  placeholder="wss://something.trycloudflare.com"
+                />
+                <button
+                  className="btn"
+                  onClick={() => onEnter(randomRoomCode(), serverUrl)}
+                  disabled={!serverUrl.trim()}
+                >
+                  Host with this address
+                </button>
+              </div>
+            )}
+          </>
+        )}
+
+        <button className="link" onClick={onSignOut} disabled={hosting}>
           Sign out
         </button>
       </div>

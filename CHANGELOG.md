@@ -3,6 +3,29 @@
 All notable changes to Kootani. Versions refer to the packaged app
 (`app/package.json`).
 
+## [0.2.0] — 2026-05-26
+
+### Added
+- **One-click hosting.** "Host a new room" now starts the signaling server and a
+  Cloudflare tunnel **inside the app** and hosts automatically — no more
+  `npm run host`, no pasting a tunnel URL, and no way to accidentally host on
+  `ws://localhost` (which worked locally but was unreachable for friends).
+  - The embedded server runs in the Electron main process on an OS-assigned
+    loopback port (so it can't collide — goodbye `EADDRINUSE`).
+  - `cloudflared` is downloaded on first host to the app's user-data folder and
+    reused after that; live progress ("Opening a secure tunnel…") is shown.
+  - Hosting is torn down automatically when you leave the room or quit the app.
+- The manual "server address" flow is still available under an **Advanced**
+  toggle in the lobby (handy for local dev or a custom server).
+
+### Fixed
+- Point the tunnel origin at `127.0.0.1` (not `localhost`) so it works on Windows,
+  where `localhost` can resolve to IPv6 `::1` first and miss the IPv4 server.
+
+### Internal
+- `ws` is now bundled into the main-process build (no extra runtime dependency to
+  ship). Removed `*.tsbuildinfo` from version control.
+
 ## [0.1.2] — 2026-05-26
 
 ### Added

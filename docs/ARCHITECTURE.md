@@ -13,6 +13,7 @@ the [README](../README.md); for fixes to specific problems, see
 - [WebRTC mesh & connection setup](#webrtc-mesh--connection-setup)
 - [Host role & transfer](#host-role--transfer)
 - [Reaching a home PC: the tunnel](#reaching-a-home-pc-the-tunnel)
+- [One-click hosting](#one-click-hosting)
 - [Invite links](#invite-links)
 - [Audio pipeline](#audio-pipeline)
 - [Authentication](#authentication)
@@ -59,8 +60,12 @@ Three independently understandable parts:
 | Part | Lives in | Runtime | Role |
 | --- | --- | --- | --- |
 | Client | `app/` | Electron (Chromium + Node) | UI, WebRTC, sign-in |
-| Signaling server | `server/` | Node + `ws` | rendezvous, room & host state |
-| Tunnel | `scripts/host.mjs` | `cloudflared` child process | makes the host PC reachable |
+| Signaling server | in-app (`app/src/main/hosting/`); standalone copy in `server/` | Node + `ws` | rendezvous, room & host state |
+| Tunnel | in-app (`app/src/main/hosting/`); or `scripts/host.mjs` | `cloudflared` child process | makes the host PC reachable |
+
+When you click **Host a new room**, the client runs the signaling server and the
+tunnel itself (see [One-click hosting](#one-click-hosting)). The standalone
+`server/` and `scripts/host.mjs` are the development / bring-your-own-server path.
 
 ## The signaling server
 
@@ -154,20 +159,49 @@ endpoint others dial.
 
 A residential PC can't accept inbound connections from another country. Rather
 than port-forwarding (fragile, impossible under CGNAT) or a VPN (setup burden),
-`npm run host` (`scripts/host.mjs`):
+Kootani opens a **Cloudflare quick tunnel**, which:
 
-1. Downloads `cloudflared` (official Cloudflare binary) on first run, cached in
-   `.cache/`.
-2. Starts the signaling server (`PORT`, default 8787).
-3. Runs `cloudflared tunnel --url http://localhost:<port>`, which dials **out** to
+1. Downloads `cloudflared` (official Cloudflare binary) on first run.
+2. Starts the signaling server on a local port.
+3. Runs `cloudflared tunnel --url http://127.0.0.1:<port>`, which dials **out** to
    Cloudflare and is handed a public `https://<random>.trycloudflare.com` URL
    that proxies back to the local server. WebSockets work over it.
-4. Parses that URL from cloudflared's output and prints the `wss://` form to paste
-   into the app.
+4. Parses that URL from cloudflared's output and surfaces the `wss://` form.
+
+This happens automatically in-app (see [One-click hosting](#one-click-hosting));
+`scripts/host.mjs` does the same from a terminal for the standalone server.
+
+> **Why `127.0.0.1`, not `localhost`?** The embedded server binds to the IPv4
+> loopback. On Windows, `localhost` can resolve to IPv6 `::1` first, so pointing
+> cloudflared at `127.0.0.1` avoids a "tunnel up but origin unreachable" failure.
 
 Quick tunnels need **no Cloudflare account and no credit card**. The trade-offs:
 the URL is **random per run** (a stable one needs a paid domain) and it's
 best-effort (no SLA) — fine for on-demand game nights.
+
+## One-click hosting
+
+`app/src/main/hosting/` makes "Host a new room" a single click — no `npm run host`,
+no pasting a tunnel URL, and no way to accidentally host on an unreachable
+`ws://localhost`. The renderer calls `window.kootani.startHosting()`; the main
+process then:
+
+1. **Starts the signaling server in-process** (`signaling.ts` —
+   `createSignalingServer(0)`), binding `127.0.0.1` on an **OS-assigned port**.
+   Port 0 means it can never collide, so the old `EADDRINUSE` problems are gone.
+   `ws` is bundled into the main-process build, so nothing extra ships.
+2. **Ensures `cloudflared`** (`cloudflared.ts` — `ensureCloudflared`), downloading
+   it once to `app.getPath("userData")/bin` (writable in a packaged build, unlike
+   the repo's `.cache/`).
+3. **Opens the tunnel** (`startTunnel`), parsing the `*.trycloudflare.com` URL
+   from cloudflared's output and resolving with the `wss://` form (with a timeout).
+4. Returns that URL; the lobby hosts a room at it and shows the invite link.
+
+Progress is streamed to the renderer over a `host:status` channel
+(`"Opening a secure tunnel…"`, etc.). Only one host session runs at a time, and
+it's torn down on room-leave and on `before-quit`. The same room/host/relay logic
+lives in both `signaling.ts` and the standalone `server/src/index.ts`; they're
+kept in sync by hand (the protocol is small and stable).
 
 ## Invite links
 
@@ -255,12 +289,12 @@ electron-builder --win`).
 
 ## Known limitations & roadmap
 
-- **Manual hosting.** Today the host runs `npm run host` and pastes the tunnel
-  URL. **Planned:** embed the signaling server + tunnel into the app so "Host a
-  new room" is one click and emits the invite link directly — which also removes
-  the easy mistake of hosting on `ws://localhost` (works locally, unreachable
-  remotely).
 - **STUN-only.** Add a free TURN relay for networks where direct P2P fails.
-- **Ephemeral tunnel URL.** Inherent to free quick tunnels.
+- **Ephemeral tunnel URL.** Inherent to free quick tunnels; a stable address would
+  need a paid domain + named tunnel.
+- **Server runs on the original host's PC.** Host *role* transfer moves room
+  ownership, but the signaling server stays on the PC that started hosting — so if
+  that person quits, the session ends for everyone. Truly portable hosting would
+  mean the new host starts their own tunnel and migrating peers to it.
 - **No video yet.** Deferred until voice is proven across the whole group; the
   mesh and `PeerView.stream` plumbing already anticipate a second media track.
