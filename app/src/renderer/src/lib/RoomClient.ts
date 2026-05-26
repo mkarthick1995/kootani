@@ -129,6 +129,14 @@ export class RoomClient {
   private muted = false;
   private error: string | null = null;
 
+  // Initial-connection retry: a freshly-opened tunnel can take a moment to become
+  // routable, so we retry the first WebSocket connect for a few seconds.
+  private static readonly MAX_CONNECT_ATTEMPTS = 10;
+  private static readonly RETRY_DELAY_MS = 1500;
+  private socketOpened = false;
+  private leaving = false;
+  private connectAttempts = 0;
+
   constructor(private readonly opts: RoomClientOptions) {}
 
   // -- lifecycle ------------------------------------------------------------
@@ -167,23 +175,47 @@ export class RoomClient {
       this.localStream = raw;
     }
 
+    this.openSocket();
+  }
+
+  /** Opens the signaling WebSocket, retrying the initial connect a few times. */
+  private openSocket(): void {
     const ws = new WebSocket(this.opts.signalingUrl);
     this.ws = ws;
 
     ws.onopen = () => {
+      this.socketOpened = true;
       this.send({ type: "join", room: this.opts.room, user: this.opts.user });
     };
     ws.onmessage = (ev) => this.onMessage(JSON.parse(ev.data) as ServerMessage);
-    ws.onerror = () => this.fail("Couldn't reach the signaling server.");
+    // onerror always precedes onclose; let onclose decide retry vs. fail.
+    ws.onerror = () => {};
     ws.onclose = () => {
-      if (this.status !== "error") {
-        this.status = "closed";
-        this.emit();
+      if (this.leaving) return;
+
+      if (this.socketOpened) {
+        // We were connected and the link dropped.
+        if (this.status !== "error") {
+          this.status = "closed";
+          this.emit();
+        }
+        return;
       }
+
+      // Never connected: the tunnel may still be warming up — retry a few times.
+      if (this.connectAttempts < RoomClient.MAX_CONNECT_ATTEMPTS) {
+        this.connectAttempts++;
+        setTimeout(() => {
+          if (!this.leaving && !this.socketOpened) this.openSocket();
+        }, RoomClient.RETRY_DELAY_MS);
+        return;
+      }
+      this.fail("Couldn't reach the signaling server.");
     };
   }
 
   leave(): void {
+    this.leaving = true;
     this.send({ type: "leave" });
     for (const p of this.peers.values()) p.pc.close();
     this.peers.clear();

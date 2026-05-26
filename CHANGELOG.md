@@ -21,6 +21,10 @@ All notable changes to Kootani. Versions refer to the packaged app
 ### Fixed
 - Point the tunnel origin at `127.0.0.1` (not `localhost`) so it works on Windows,
   where `localhost` can resolve to IPv6 `::1` first and miss the IPv4 server.
+- Don't hand back the tunnel URL until cloudflared has **registered** its edge
+  connection, and **retry** the initial signaling connect for a few seconds —
+  fixes an intermittent "Couldn't reach the signaling server" right after
+  hosting, when the app connected before the freshly-opened tunnel was routable.
 
 ### Internal
 - `ws` is now bundled into the main-process build (no extra runtime dependency to

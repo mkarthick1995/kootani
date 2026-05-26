@@ -52,12 +52,20 @@ export interface Tunnel {
 }
 
 const URL_RE = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/;
+const REGISTERED_RE = /registered tunnel connection/i;
 const TUNNEL_TIMEOUT_MS = 30_000;
+// If cloudflared prints the URL but we never see a "registered" line (e.g. a log
+// format change), resolve this long after the URL anyway rather than hang.
+const REGISTER_FALLBACK_MS = 6_000;
 
 /**
- * Spawns `cloudflared tunnel --url http://localhost:<port>` and resolves with
- * the public address once cloudflared prints it. Rejects on timeout or if the
- * process exits before announcing a URL.
+ * Spawns `cloudflared tunnel --url http://127.0.0.1:<port>` and resolves with the
+ * public address once the tunnel is actually routable.
+ *
+ * cloudflared prints the URL in its startup banner *before* it has registered an
+ * edge connection — connecting at that instant fails. So we capture the URL but
+ * only resolve once cloudflared logs that a tunnel connection is registered (with
+ * a time-based fallback). Rejects on timeout or if the process exits early.
  */
 export function startTunnel(bin: string, port: number, onLog?: (line: string) => void): Promise<Tunnel> {
   return new Promise<Tunnel>((resolve, reject) => {
@@ -71,12 +79,16 @@ export function startTunnel(bin: string, port: number, onLog?: (line: string) =>
     );
 
     let settled = false;
-    const finishOk = (httpsUrl: string): void => {
-      if (settled) return;
+    let url: string | null = null;
+    let fallbackTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const finishOk = (): void => {
+      if (settled || !url) return;
       settled = true;
       clearTimeout(timer);
+      if (fallbackTimer) clearTimeout(fallbackTimer);
       resolve({
-        url: httpsUrl.replace(/^https:/, "wss:"),
+        url: url.replace(/^https:/, "wss:"),
         stop: () => child.kill(),
       });
     };
@@ -84,6 +96,7 @@ export function startTunnel(bin: string, port: number, onLog?: (line: string) =>
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (fallbackTimer) clearTimeout(fallbackTimer);
       child.kill();
       reject(err);
     };
@@ -96,8 +109,16 @@ export function startTunnel(bin: string, port: number, onLog?: (line: string) =>
     const scan = (buf: Buffer): void => {
       const text = String(buf);
       onLog?.(text.trim());
-      const m = text.match(URL_RE);
-      if (m) finishOk(m[0]);
+      if (!url) {
+        const m = text.match(URL_RE);
+        if (m) {
+          url = m[0];
+          // Safety net in case the "registered" line never matches.
+          fallbackTimer = setTimeout(finishOk, REGISTER_FALLBACK_MS);
+        }
+      }
+      // The tunnel is only routable once an edge connection is registered.
+      if (url && REGISTERED_RE.test(text)) finishOk();
     };
     child.stdout?.on("data", scan);
     child.stderr?.on("data", scan); // cloudflared prints the URL to stderr
