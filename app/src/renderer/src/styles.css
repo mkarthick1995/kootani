@@ -344,6 +344,10 @@ body {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
   gap: 14px;
+  /* Become the scroll region so a tall screen-share stage above us doesn't push
+     the window; min-height:0 lets a flex child actually shrink and scroll. */
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
 }
 .peer {
@@ -488,4 +492,142 @@ input[type="range"] {
 .conn.connecting,
 .conn.new {
   color: var(--warn);
+}
+
+/* Screen sharing — stage */
+.screen-stage {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
+  padding: 16px 24px 0;
+}
+.screen-stage.multi {
+  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+}
+.screen-tile {
+  position: relative;
+  margin: 0;
+  background: #000;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.screen-video {
+  display: block;
+  width: 100%;
+  max-height: 46vh;
+  object-fit: contain;
+  background: #000;
+}
+.screen-stage.multi .screen-video {
+  max-height: 32vh;
+}
+.screen-caption {
+  position: absolute;
+  left: 10px;
+  bottom: 10px;
+  background: rgba(0, 0, 0, 0.6);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 9px;
+  border-radius: 7px;
+}
+.screen-caption em {
+  color: var(--muted);
+  font-style: normal;
+  font-weight: 400;
+}
+
+/* Screen sharing — picker modal */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  z-index: 50;
+}
+.modal {
+  background: var(--surface);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: var(--radius);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.5);
+  padding: 20px 22px;
+}
+.modal.picker {
+  width: min(820px, 92vw);
+  max-height: 84vh;
+  display: flex;
+  flex-direction: column;
+}
+.picker-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.picker-head h2 {
+  margin: 0;
+  font-size: 18px;
+}
+.picker-close {
+  margin: 0;
+  font-size: 16px;
+}
+.picker-scroll {
+  overflow-y: auto;
+  margin-top: 8px;
+}
+.picker-group-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin: 14px 0 8px;
+}
+.picker-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 12px;
+}
+.source-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px;
+  background: var(--surface-2);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  cursor: pointer;
+  color: var(--text);
+  text-align: left;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.source-tile:hover {
+  border-color: var(--accent);
+  background: #353a49;
+}
+.source-thumb {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  border-radius: 6px;
+  background: #000;
+}
+.source-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.source-icon {
+  width: 16px;
+  height: 16px;
+  flex: none;
 }

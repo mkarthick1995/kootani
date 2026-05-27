@@ -7,6 +7,8 @@ const api: KootaniApi = {
   copyText: (text) => ipcRenderer.invoke("clipboard:write", text),
   startHosting: () => ipcRenderer.invoke("host:start"),
   stopHosting: () => ipcRenderer.invoke("host:stop"),
+  getScreenSources: () => ipcRenderer.invoke("screen:sources"),
+  prepareScreenShare: (sourceId) => ipcRenderer.invoke("screen:prepare", sourceId),
   onHostStatus: (cb) => {
     const listener = (_e: unknown, status: string): void => cb(status);
     ipcRenderer.on("host:status", listener);

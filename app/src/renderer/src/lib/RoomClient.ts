@@ -1,10 +1,11 @@
 /**
  * RoomClient — owns the signaling socket and the WebRTC peer mesh.
  *
- * Topology: full mesh. Each pair of peers has one RTCPeerConnection. The
- * offer direction is fixed by the server convention (the JOINING peer offers
- * to everyone already present), so there's no glare and we don't need
- * perfect-negotiation rollback in the skeleton.
+ * Topology: full mesh. Each pair of peers has one RTCPeerConnection. Newcomers
+ * still kick off the first offer (their tracks fire negotiationneeded on join),
+ * but because screen sharing lets either side add/drop a track mid-call, we use
+ * the perfect-negotiation pattern to resolve the resulting offer glare instead
+ * of relying on a fixed offer direction. See ensurePeer/onSignal.
  *
  * The class is framework-agnostic: it exposes a snapshot + an onState callback
  * that React subscribes to. Media never touches the signaling server.
@@ -19,7 +20,11 @@ import type { ClientMessage, PeerInfo, ServerMessage, UserInfo } from "@shared/p
  */
 export type SignalData =
   | { kind: "sdp"; description: RTCSessionDescriptionInit }
-  | { kind: "ice"; candidate: RTCIceCandidateInit };
+  | { kind: "ice"; candidate: RTCIceCandidateInit }
+  // Announces that the sender has started/stopped sharing their screen. The
+  // pixels travel as a normal video track (negotiated via SDP); this just flags
+  // the UI and lets the receiver drop the view promptly when sharing stops.
+  | { kind: "screen"; on: boolean };
 
 /**
  * ICE servers. STUN lets peers discover their public address; it's enough for
@@ -76,8 +81,12 @@ export interface PeerView {
   id: string;
   user: UserInfo;
   isHost: boolean;
-  /** Remote audio (and later video) stream, once negotiated. */
+  /** Remote voice stream, once negotiated. */
   stream: MediaStream | null;
+  /** The peer's shared-screen stream (video + any system audio), if sharing. */
+  screenStream: MediaStream | null;
+  /** Whether the peer is currently sharing their screen. */
+  sharingScreen: boolean;
   connection: RTCPeerConnectionState;
   /** How loudly *this* user hears the peer (0–1). Local-only. */
   outputVolume: number;
@@ -91,6 +100,10 @@ export interface RoomSnapshot {
   self: UserInfo;
   isSelfHost: boolean;
   muted: boolean;
+  /** Whether *this* user is currently sharing their screen. */
+  sharing: boolean;
+  /** This user's own shared-screen stream, for a local self-preview. */
+  localScreenStream: MediaStream | null;
   settings: MediaSettings;
   peers: PeerView[];
   error: string | null;
@@ -99,10 +112,22 @@ export interface RoomSnapshot {
 interface PeerState {
   info: PeerInfo;
   pc: RTCPeerConnection;
+  /** Remote voice stream. */
   stream: MediaStream | null;
+  /** Remote shared-screen stream (video + any system audio). */
+  screenStream: MediaStream | null;
+  sharingScreen: boolean;
   connection: RTCPeerConnectionState;
   pendingCandidates: RTCIceCandidateInit[];
   outputVolume: number;
+  // Perfect-negotiation bookkeeping. Either side may now (re)negotiate — adding
+  // or dropping a screen track fires negotiationneeded on whichever peer shares —
+  // so we can no longer assume a fixed offerer. `polite` is decided by a stable
+  // id comparison (opposite on each end); on an offer collision the impolite peer
+  // ignores the incoming offer while the polite peer rolls back and accepts it.
+  polite: boolean;
+  makingOffer: boolean;
+  ignoreOffer: boolean;
 }
 
 export interface RoomClientOptions {
@@ -122,6 +147,11 @@ export class RoomClient {
   private audioCtx: AudioContext | null = null;
   private gainNode: GainNode | null = null;
   private settings: MediaSettings = loadSettings();
+
+  // Screen share: a separate getDisplayMedia stream (video + optional system
+  // audio) whose tracks are added to every peer connection while sharing.
+  private screenStream: MediaStream | null = null;
+  private sharing = false;
 
   private status: RoomStatus = "connecting";
   private selfId: string | null = null;
@@ -237,6 +267,9 @@ export class RoomClient {
     for (const p of this.peers.values()) p.pc.close();
     this.peers.clear();
     this.localStream?.getTracks().forEach((t) => t.stop());
+    this.screenStream?.getTracks().forEach((t) => t.stop());
+    this.screenStream = null;
+    this.sharing = false;
     this.rawTrack?.stop();
     this.rawTrack = null;
     this.localStream = null;
@@ -259,6 +292,56 @@ export class RoomClient {
 
   transferHostTo(peerId: string): void {
     this.send({ type: "transfer-host", to: peerId });
+  }
+
+  // -- screen sharing -------------------------------------------------------
+
+  /**
+   * Capture the screen/window the user picked (the main process resolves which
+   * one) and push it to every peer. Resolves quietly on failure. The source must
+   * be chosen via window.kootani.prepareScreenShare() first.
+   */
+  async startScreenShare(): Promise<void> {
+    if (this.sharing) return;
+    let stream: MediaStream;
+    try {
+      // audio: true picks up system/loopback audio so game sound is shared too.
+      stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+    } catch (err) {
+      // Our own picker (not the OS one) chose the source, so this is a real
+      // capture failure rather than a user cancel — record it for diagnostics.
+      this.log(`getDisplayMedia failed: ${String(err)}`);
+      return;
+    }
+    this.screenStream = stream;
+    this.sharing = true;
+    // Stopping via Windows' own "stop sharing" overlay ends the track — mirror that.
+    stream.getVideoTracks()[0]?.addEventListener("ended", () => this.stopScreenShare());
+    for (const ps of this.peers.values()) this.addScreenTracks(ps);
+    this.emit();
+  }
+
+  /** Stop sharing: drop the tracks from every peer (renegotiating) and notify them. */
+  stopScreenShare(): void {
+    if (!this.sharing) return;
+    this.sharing = false;
+    const tracks = this.screenStream?.getTracks() ?? [];
+    for (const ps of this.peers.values()) {
+      ps.pc.getSenders().forEach((s) => {
+        if (s.track && tracks.includes(s.track)) ps.pc.removeTrack(s);
+      });
+      this.sendSignal(ps.info.id, { kind: "screen", on: false });
+    }
+    tracks.forEach((t) => t.stop());
+    this.screenStream = null;
+    this.emit();
+  }
+
+  /** Add the current screen tracks to one peer and tell them a share is starting. */
+  private addScreenTracks(ps: PeerState): void {
+    if (!this.screenStream) return;
+    this.screenStream.getTracks().forEach((t) => ps.pc.addTrack(t, this.screenStream!));
+    this.sendSignal(ps.info.id, { kind: "screen", on: true });
   }
 
   // -- audio controls (all local to this user) ------------------------------
@@ -323,19 +406,20 @@ export class RoomClient {
         this.selfId = msg.selfId;
         this.hostId = msg.hostId;
         this.status = "connected";
-        // We're the newcomer: offer to everyone already here.
-        for (const peer of msg.peers) {
-          const ps = this.ensurePeer(peer);
-          void this.makeOffer(ps);
-        }
+        // We're the newcomer: building each peer adds our tracks, which fires
+        // negotiationneeded so we offer to everyone already here.
+        for (const peer of msg.peers) this.ensurePeer(peer);
         this.emit();
         break;
 
-      case "peer-joined":
-        // They're the newcomer; they'll offer to us. Just prepare the connection.
-        this.ensurePeer(msg.peer);
+      case "peer-joined": {
+        // They're the newcomer. ensurePeer adds our tracks (incl. our screen, if
+        // we're sharing) and negotiates; tell them about the share so they label it.
+        const ps = this.ensurePeer(msg.peer);
+        if (this.sharing) this.sendSignal(ps.info.id, { kind: "screen", on: true });
         this.emit();
         break;
+      }
 
       case "peer-left": {
         const ps = this.peers.get(msg.peerId);
@@ -373,31 +457,74 @@ export class RoomClient {
     }
 
     const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-    ps = { info, pc, stream: null, connection: "new", pendingCandidates: [], outputVolume: 1 };
-    this.peers.set(info.id, ps);
+    // Politeness must be stable and opposite on the two ends; a plain id compare
+    // gives that (my id vs theirs flips when they compute it about me).
+    const polite = (this.selfId ?? "") > info.id;
+    const state: PeerState = {
+      info,
+      pc,
+      stream: null,
+      screenStream: null,
+      sharingScreen: false,
+      connection: "new",
+      pendingCandidates: [],
+      outputVolume: 1,
+      polite,
+      makingOffer: false,
+      ignoreOffer: false,
+    };
+    ps = state;
+    this.peers.set(info.id, state);
 
+    // Add our voice, and our screen too if we're already sharing when they join.
     this.localStream?.getTracks().forEach((t) => pc.addTrack(t, this.localStream!));
+    if (this.screenStream) {
+      this.screenStream.getTracks().forEach((t) => pc.addTrack(t, this.screenStream!));
+    }
 
     pc.onicecandidate = (e) => {
       if (e.candidate) this.sendSignal(info.id, { kind: "ice", candidate: e.candidate.toJSON() });
     };
+    // A stream carrying video is a screen share (plus any system audio it brought);
+    // an audio-only stream is voice. We key off the stream the sender attached the
+    // track to (each getDisplayMedia/getUserMedia stream has its own id), so a
+    // screen's video + system audio land together. The guard stops a screen's audio
+    // track — which can arrive before its video — from clobbering the voice stream:
+    // a new audio-only stream is only treated as voice if we have no voice yet (or
+    // it's the same stream); otherwise it waits for its video to mark it a screen.
     pc.ontrack = (e) => {
-      ps!.stream = e.streams[0] ?? null;
+      const stream = e.streams[0];
+      if (!stream) return;
+      if (stream.getVideoTracks().length > 0 || e.track.kind === "video") {
+        state.screenStream = stream;
+      } else if (!state.stream || stream.id === state.stream.id) {
+        state.stream = stream;
+      }
       this.emit();
     };
     pc.onconnectionstatechange = () => {
-      ps!.connection = pc.connectionState;
+      state.connection = pc.connectionState;
       this.emit();
     };
+    // Either side may (re)negotiate when tracks are added/removed. setLocalDescription()
+    // with no args creates an offer when stable; perfect negotiation (onSignal) sorts
+    // out any collision with the other end's simultaneous offer.
+    pc.onnegotiationneeded = async () => {
+      try {
+        state.makingOffer = true;
+        await pc.setLocalDescription();
+        await this.tuneAudioBitrate(pc);
+        if (pc.localDescription) {
+          this.sendSignal(info.id, { kind: "sdp", description: pc.localDescription.toJSON() });
+        }
+      } catch (err) {
+        this.log(`negotiationneeded error for ${info.id}: ${String(err)}`);
+      } finally {
+        state.makingOffer = false;
+      }
+    };
 
-    return ps;
-  }
-
-  private async makeOffer(ps: PeerState): Promise<void> {
-    const offer = await ps.pc.createOffer();
-    await ps.pc.setLocalDescription(offer);
-    await this.tuneAudioBitrate(ps.pc);
-    this.sendSignal(ps.info.id, { kind: "sdp", description: offer });
+    return state;
   }
 
   /** Raise the Opus bitrate for clearer voice (default is ~32 kbps). */
@@ -420,9 +547,20 @@ export class RoomClient {
     const ps = this.peers.get(from);
     if (!ps) return; // peer-joined should have created it; ignore strays
 
+    if (data.kind === "screen") {
+      ps.sharingScreen = data.on;
+      if (!data.on) ps.screenStream = null; // drop the view as soon as they stop
+      this.emit();
+      return;
+    }
+
     if (data.kind === "ice") {
+      // Buffer until we have a remote description; suppress errors for a candidate
+      // belonging to an offer we deliberately ignored during a collision.
       if (ps.pc.remoteDescription) {
-        await ps.pc.addIceCandidate(data.candidate).catch(() => {});
+        await ps.pc.addIceCandidate(data.candidate).catch((err) => {
+          if (!ps.ignoreOffer) this.log(`addIceCandidate failed for ${from}: ${String(err)}`);
+        });
       } else {
         ps.pendingCandidates.push(data.candidate);
       }
@@ -430,14 +568,26 @@ export class RoomClient {
     }
 
     const desc = data.description;
-    await ps.pc.setRemoteDescription(desc);
-    await this.drainCandidates(ps);
+    // Collision: their offer arrives while we're mid-offer or otherwise unstable.
+    const collision =
+      desc.type === "offer" && (ps.makingOffer || ps.pc.signalingState !== "stable");
+    ps.ignoreOffer = !ps.polite && collision;
+    if (ps.ignoreOffer) return; // impolite peer keeps its own offer
 
-    if (desc.type === "offer") {
-      const answer = await ps.pc.createAnswer();
-      await ps.pc.setLocalDescription(answer);
-      await this.tuneAudioBitrate(ps.pc);
-      this.sendSignal(from, { kind: "sdp", description: answer });
+    try {
+      // On the polite side a collision is resolved by setRemoteDescription, which
+      // implicitly rolls back our own offer (supported by Chromium/Electron).
+      await ps.pc.setRemoteDescription(desc);
+      await this.drainCandidates(ps);
+      if (desc.type === "offer") {
+        await ps.pc.setLocalDescription(); // implicit answer
+        await this.tuneAudioBitrate(ps.pc);
+        if (ps.pc.localDescription) {
+          this.sendSignal(from, { kind: "sdp", description: ps.pc.localDescription.toJSON() });
+        }
+      }
+    } catch (err) {
+      this.log(`onSignal error for ${from}: ${String(err)}`);
     }
   }
 
@@ -466,6 +616,8 @@ export class RoomClient {
       user: p.info.user,
       isHost: p.info.id === this.hostId,
       stream: p.stream,
+      screenStream: p.screenStream,
+      sharingScreen: p.sharingScreen,
       connection: p.connection,
       outputVolume: p.outputVolume,
     }));
@@ -478,6 +630,8 @@ export class RoomClient {
       self: this.opts.user,
       isSelfHost: this.selfId !== null && this.selfId === this.hostId,
       muted: this.muted,
+      sharing: this.sharing,
+      localScreenStream: this.screenStream,
       settings: { ...this.settings },
       peers,
       error: this.error,

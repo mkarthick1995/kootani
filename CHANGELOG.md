@@ -3,6 +3,25 @@
 All notable changes to Kootani. Versions refer to the packaged app
 (`app/package.json`).
 
+## [0.3.0] — 2026-05-28
+
+### Added
+- **Screen sharing.** A "🖥 Share screen" button in the room lets you share a
+  whole monitor or a single window; system/game audio rides along (Windows
+  loopback). Anyone in the room can share, multiple shares show side by side,
+  and shared screens appear on a stage above the participants.
+  - Electron has no native screen picker on Windows, so Kootani shows its own:
+    a grid of live thumbnails for each screen and window, resolved through a
+    main-process `desktopCapturer` + `setDisplayMediaRequestHandler`.
+  - Stopping via the button or Windows' own "stop sharing" overlay both tear the
+    share down and drop the view for everyone.
+
+### Changed
+- The peer mesh now uses **perfect negotiation** (polite/impolite roles, offer
+  rollback) instead of a fixed offer direction. Adding or removing a screen
+  track mid-call renegotiates from whichever side is sharing, so a fixed offerer
+  no longer holds — this resolves the resulting offer glare cleanly.
+
 ## [0.2.1] — 2026-05-27
 
 ### Fixed

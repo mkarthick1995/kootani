@@ -4,6 +4,8 @@ import type { KootaniConfig } from "@shared/ipc";
 import { RoomClient, type MediaSettings, type RoomSnapshot } from "./lib/RoomClient";
 import { decodeJoinLink, encodeJoinLink, normalizeWsUrl } from "./lib/joinlink";
 import { RemoteAudio } from "./components/RemoteAudio";
+import { ScreenVideo } from "./components/ScreenVideo";
+import { ScreenPicker } from "./components/ScreenPicker";
 
 type Phase = "login" | "lobby" | "room";
 
@@ -331,6 +333,7 @@ function Room({
 }): JSX.Element {
   const [copied, setCopied] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [picking, setPicking] = useState(false);
   const joinLink = encodeJoinLink({ url: inviteUrl, room: snapshot.room });
 
   const copyLink = (): void => {
@@ -338,6 +341,22 @@ function Room({
     setCopied(true);
     setTimeout(() => setCopied(false), 1400);
   };
+
+  const pickSource = async (sourceId: string): Promise<void> => {
+    setPicking(false);
+    await window.kootani.prepareScreenShare(sourceId);
+    await client.startScreenShare();
+  };
+
+  // Self-preview first (muted), then any peers actively sharing (with sound).
+  const screenShares = [
+    ...(snapshot.sharing && snapshot.localScreenStream
+      ? [{ id: "self", label: "You", stream: snapshot.localScreenStream, muted: true }]
+      : []),
+    ...snapshot.peers
+      .filter((p) => p.screenStream)
+      .map((p) => ({ id: p.id, label: p.user.name, stream: p.screenStream!, muted: false })),
+  ];
 
   return (
     <div className="room">
@@ -356,6 +375,15 @@ function Room({
           </span>
         </div>
         <div className="header-actions">
+          {snapshot.sharing ? (
+            <button className="btn small danger" onClick={() => client.stopScreenShare()}>
+              ⛔ Stop sharing
+            </button>
+          ) : (
+            <button className="btn small" onClick={() => setPicking(true)}>
+              🖥 Share screen
+            </button>
+          )}
           <button
             className={`btn small ${showSettings ? "primary" : ""}`}
             onClick={() => setShowSettings((s) => !s)}
@@ -367,6 +395,8 @@ function Room({
           </button>
         </div>
       </header>
+
+      {picking && <ScreenPicker onPick={pickSource} onCancel={() => setPicking(false)} />}
 
       <div className="invite-bar">
         <span className="field-label">Invite link</span>
@@ -385,6 +415,20 @@ function Room({
 
       {snapshot.error && snapshot.status !== "error" && (
         <div className="banner">{snapshot.error}</div>
+      )}
+
+      {screenShares.length > 0 && (
+        <div className={`screen-stage ${screenShares.length > 1 ? "multi" : ""}`}>
+          {screenShares.map((share) => (
+            <figure className="screen-tile" key={share.id}>
+              <ScreenVideo stream={share.stream} muted={share.muted} />
+              <figcaption className="screen-caption">
+                🖥 {share.label}
+                {share.id === "self" && <em> (your screen)</em>}
+              </figcaption>
+            </figure>
+          ))}
+        </div>
       )}
 
       <ul className="peer-grid">

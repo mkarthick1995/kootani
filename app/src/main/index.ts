@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { app, BrowserWindow, clipboard, ipcMain, session, shell } from "electron";
+import { app, BrowserWindow, clipboard, desktopCapturer, ipcMain, session, shell } from "electron";
 import { googleLogin } from "./auth.js";
 import { loadConfig, type AppConfig } from "./config.js";
 import { startHosting, stopHosting } from "./hosting/index.js";
@@ -44,11 +44,36 @@ function createWindow(): void {
 app.whenReady().then(() => {
   config = loadConfig();
 
-  // getUserMedia (mic/cam) needs the media permission granted in-app.
+  // getUserMedia (mic) and getDisplayMedia (screen) need media/display-capture
+  // granted in-app — we have no UI to prompt for them.
+  const allowed = (p: string): boolean => p === "media" || p === "display-capture";
   session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
-    callback(permission === "media");
+    callback(allowed(permission));
   });
-  session.defaultSession.setPermissionCheckHandler((_wc, permission) => permission === "media");
+  session.defaultSession.setPermissionCheckHandler((_wc, permission) => allowed(permission));
+
+  // Screen sharing. Electron has no built-in picker on Windows, so getDisplayMedia
+  // must be answered by us: the renderer shows our own picker, stashes the chosen
+  // source id via "screen:prepare", then calls getDisplayMedia — and this handler
+  // resolves that id to a desktopCapturer source. `audio: "loopback"` also captures
+  // system audio (game sound) on Windows. Without a stashed id we deny the request.
+  let pendingScreenSourceId: string | null = null;
+  session.defaultSession.setDisplayMediaRequestHandler((_request, callback) => {
+    const wanted = pendingScreenSourceId;
+    pendingScreenSourceId = null;
+    if (!wanted) {
+      callback({}); // nothing selected → deny
+      return;
+    }
+    desktopCapturer
+      .getSources({ types: ["screen", "window"] })
+      .then((sources) => {
+        const match = sources.find((s) => s.id === wanted);
+        if (match) callback({ video: match, audio: "loopback" });
+        else callback({});
+      })
+      .catch(() => callback({}));
+  });
 
   ipcMain.handle("config:get", () => ({
     signalingUrl: config.signalingUrl,
@@ -80,6 +105,25 @@ app.whenReady().then(() => {
     });
   });
   ipcMain.handle("host:stop", () => stopHosting());
+
+  // Enumerate shareable screens/windows with thumbnails for the in-app picker.
+  ipcMain.handle("screen:sources", async () => {
+    const sources = await desktopCapturer.getSources({
+      types: ["screen", "window"],
+      thumbnailSize: { width: 320, height: 180 },
+      fetchWindowIcons: true,
+    });
+    return sources.map((s) => ({
+      id: s.id,
+      name: s.name,
+      thumbnail: s.thumbnail.toDataURL(),
+      appIcon: s.appIcon && !s.appIcon.isEmpty() ? s.appIcon.toDataURL() : null,
+    }));
+  });
+  // Remember the user's pick for the imminent getDisplayMedia call (see handler above).
+  ipcMain.handle("screen:prepare", (_e, sourceId: string) => {
+    pendingScreenSourceId = String(sourceId);
+  });
 
   // Renderer-side diagnostics (WebSocket connect attempts, close codes, retries)
   // funnelled into the same host log so the whole picture is in one file.

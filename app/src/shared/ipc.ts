@@ -10,6 +10,18 @@ export interface KootaniConfig {
   googleConfigured: boolean;
 }
 
+/** A screen or window the user can share, as offered by the OS picker. */
+export interface ScreenSource {
+  /** Opaque id from desktopCapturer; passed back to prepareScreenShare. */
+  id: string;
+  /** Human label, e.g. "Screen 1" or a window title. */
+  name: string;
+  /** A still thumbnail as a data: URL, for the picker grid. */
+  thumbnail: string;
+  /** The owning app's icon as a data: URL (windows only), or null. */
+  appIcon: string | null;
+}
+
 export interface KootaniApi {
   getConfig(): Promise<KootaniConfig>;
   googleLogin(): Promise<UserInfo>;
@@ -27,6 +39,15 @@ export interface KootaniApi {
   startHosting(): Promise<{ url: string; localUrl: string }>;
   /** Tear down the in-app server + tunnel. */
   stopHosting(): Promise<void>;
+  /** List the screens/windows available to share (with thumbnails). */
+  getScreenSources(): Promise<ScreenSource[]>;
+  /**
+   * Choose which source the next getDisplayMedia() call will capture. Must be
+   * called right before the renderer invokes getDisplayMedia — the main-process
+   * display-media handler reads this to pick the source (our in-app picker
+   * replaces Electron's absent native one).
+   */
+  prepareScreenShare(sourceId: string): Promise<void>;
   /** Subscribe to hosting progress messages. Returns an unsubscribe function. */
   onHostStatus(cb: (status: string) => void): () => void;
   /** Fire-and-forget: append a line to the host diagnostics log (main process). */
