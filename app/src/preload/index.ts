@@ -12,6 +12,7 @@ const api: KootaniApi = {
     ipcRenderer.on("host:status", listener);
     return () => ipcRenderer.removeListener("host:status", listener);
   },
+  log: (message) => ipcRenderer.send("host:log", String(message)),
 };
 
 contextBridge.exposeInMainWorld("kootani", api);

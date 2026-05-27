@@ -18,6 +18,10 @@ export function App(): JSX.Element {
   const [config, setConfig] = useState<KootaniConfig | null>(null);
   const [user, setUser] = useState<UserInfo | null>(null);
   const [signalingUrl, setSignalingUrl] = useState("");
+  // The address shown in the room's invite bar — what friends connect to. For a
+  // self-hosted room this is the public tunnel URL, which is NOT the same as the
+  // URL this PC connects to (loopback); see enterRoom.
+  const [inviteUrl, setInviteUrl] = useState("");
   const [snapshot, setSnapshot] = useState<RoomSnapshot | null>(null);
   const clientRef = useRef<RoomClient | null>(null);
   // True when this PC is running the signaling server/tunnel for the session,
@@ -32,13 +36,15 @@ export function App(): JSX.Element {
   }, []);
 
   const enterRoom = useCallback(
-    (room: string, url: string, selfHosted = false) => {
+    (room: string, connectUrl: string, opts?: { selfHosted?: boolean; inviteUrl?: string }) => {
       if (!user) return;
-      const normalized = normalizeWsUrl(url);
-      setSignalingUrl(normalized);
-      selfHostedRef.current = selfHosted;
+      // The URL we connect to and the URL we hand to friends can differ: a host
+      // connects to its own server over loopback while friends use the tunnel URL.
+      const connect = normalizeWsUrl(connectUrl);
+      setInviteUrl(normalizeWsUrl(opts?.inviteUrl ?? connectUrl));
+      selfHostedRef.current = opts?.selfHosted ?? false;
       const client = new RoomClient({
-        signalingUrl: normalized,
+        signalingUrl: connect,
         room,
         user,
         onState: setSnapshot,
@@ -77,7 +83,7 @@ export function App(): JSX.Element {
         <Room
           snapshot={snapshot}
           client={clientRef.current!}
-          signalingUrl={signalingUrl}
+          inviteUrl={inviteUrl}
           onLeave={leaveRoom}
         />
       )}
@@ -167,7 +173,11 @@ function Lobby({
 }: {
   user: UserInfo;
   defaultUrl: string;
-  onEnter: (room: string, url: string, selfHosted?: boolean) => void;
+  onEnter: (
+    room: string,
+    connectUrl: string,
+    opts?: { selfHosted?: boolean; inviteUrl?: string },
+  ) => void;
   onSignOut: () => void;
 }): JSX.Element {
   const [link, setLink] = useState("");
@@ -201,8 +211,9 @@ function Lobby({
     setHostStatus("Starting…");
     const unsubscribe = window.kootani.onHostStatus(setHostStatus);
     try {
-      const { url } = await window.kootani.startHosting();
-      onEnter(randomRoomCode(), url, true); // navigates away on success
+      const { url, localUrl } = await window.kootani.startHosting();
+      // Connect to our own server over loopback; share the tunnel URL with friends.
+      onEnter(randomRoomCode(), localUrl, { selfHosted: true, inviteUrl: url }); // navigates away on success
     } catch (e) {
       setHostError(e instanceof Error ? e.message : "Couldn't start hosting.");
       void window.kootani.stopHosting();
@@ -310,17 +321,17 @@ function Lobby({
 function Room({
   snapshot,
   client,
-  signalingUrl,
+  inviteUrl,
   onLeave,
 }: {
   snapshot: RoomSnapshot;
   client: RoomClient;
-  signalingUrl: string;
+  inviteUrl: string;
   onLeave: () => void;
 }): JSX.Element {
   const [copied, setCopied] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const joinLink = encodeJoinLink({ url: signalingUrl, room: snapshot.room });
+  const joinLink = encodeJoinLink({ url: inviteUrl, room: snapshot.room });
 
   const copyLink = (): void => {
     void window.kootani.copyText(joinLink);

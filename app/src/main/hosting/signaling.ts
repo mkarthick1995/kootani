@@ -13,6 +13,7 @@ import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import type { ClientMessage, ServerMessage, PeerInfo, UserInfo } from "../../shared/protocol.js";
+import { hostLog } from "./logger.js";
 
 export interface SignalingHandle {
   /** The actual port the server bound to (we ask the OS for a free one). */
@@ -136,6 +137,9 @@ export function createSignalingServer(preferredPort = 0): Promise<SignalingHandl
   };
 
   const httpServer = createServer((req, res) => {
+    // Logged so we can see plain HTTP requests (e.g. a browser/health hit)
+    // actually arriving through the tunnel.
+    hostLog(`[server] HTTP ${req.method} ${req.url} from ${req.socket.remoteAddress}`);
     if (req.url === "/health" || req.url === "/") {
       res.writeHead(200, { "content-type": "text/plain" });
       res.end(`Kootani signaling server — ${rooms.size} active room(s)`);
@@ -145,9 +149,18 @@ export function createSignalingServer(preferredPort = 0): Promise<SignalingHandl
     res.end();
   });
 
+  // Passive upgrade logger: fires for EVERY WebSocket upgrade attempt that
+  // reaches the origin (ws attaches its own upgrade handler separately). If a
+  // client says it's "connecting" but nothing shows up here, the request never
+  // made it through the tunnel — i.e. the edge isn't routing to us.
+  httpServer.on("upgrade", (req) => {
+    hostLog(`[server] WS upgrade attempt ${req.url} from ${req.socket.remoteAddress}`);
+  });
+
   const wss = new WebSocketServer({ server: httpServer });
 
-  wss.on("connection", (ws) => {
+  wss.on("connection", (ws, req) => {
+    hostLog(`[server] WS connection established from ${req.socket.remoteAddress}`);
     ws.on("message", (raw) => {
       let msg: ClientMessage;
       try {

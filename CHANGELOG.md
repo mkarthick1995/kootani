@@ -3,6 +3,24 @@
 All notable changes to Kootani. Versions refer to the packaged app
 (`app/package.json`).
 
+## [0.2.1] — 2026-05-27
+
+### Fixed
+- **Hosting no longer fails with "Couldn't reach the signaling server."** The
+  host was connecting to its own signaling server through the public tunnel URL —
+  routing out to Cloudflare's edge and back to the same machine. A reachability
+  probe showed why that failed: an external network reached the tunnel's origin
+  fine, while the origin's *own* machine got HTTP 530 from Cloudflare's edge and
+  the request never arrived. The host now connects to its server over loopback
+  (`ws://127.0.0.1:<port>`) and only hands the tunnel URL to friends in the invite
+  link. Hosting connects instantly and reliably; the tunnel only carries traffic
+  from the outside internet, which is exactly the path that works.
+- Also removed the 0.2.0 main-process health poll that gated hosting on the
+  tunnel being reachable from this machine — the very check that was failing
+  above. cloudflared is spawned with `--protocol http2 --edge-ip-version 4` (plain
+  TCP/443, IPv4) for broad network compatibility, and the renderer's WebSocket
+  retry is patient up to ~45s to absorb edge route-propagation for friends.
+
 ## [0.2.0] — 2026-05-26
 
 ### Added

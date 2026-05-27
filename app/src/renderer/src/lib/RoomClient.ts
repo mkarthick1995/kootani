@@ -129,9 +129,13 @@ export class RoomClient {
   private muted = false;
   private error: string | null = null;
 
-  // Initial-connection retry: a freshly-opened tunnel can take a moment to become
-  // routable, so we retry the first WebSocket connect for a few seconds.
-  private static readonly MAX_CONNECT_ATTEMPTS = 10;
+  // Initial-connection retry: after cloudflared registers, Cloudflare's edge takes
+  // a few seconds to publish a route to a freshly-opened tunnel, so the first
+  // WebSocket connect(s) can fail (close 1006 / DNS not-yet-resolving). We retry
+  // here rather than gating in the main process: this socket is the same stack
+  // that carries real traffic, so if it can connect, the tunnel genuinely works.
+  // ~45s of patience covers normal edge propagation without hanging forever.
+  private static readonly MAX_CONNECT_ATTEMPTS = 30;
   private static readonly RETRY_DELAY_MS = 1500;
   private socketOpened = false;
   private leaving = false;
@@ -178,19 +182,31 @@ export class RoomClient {
     this.openSocket();
   }
 
+  /** Diagnostics: forward a line to the main-process host log (no-op if absent). */
+  private log(message: string): void {
+    try {
+      window.kootani?.log?.(`RoomClient: ${message}`);
+    } catch {
+      /* logging must never break connection logic */
+    }
+  }
+
   /** Opens the signaling WebSocket, retrying the initial connect a few times. */
   private openSocket(): void {
+    this.log(`connect attempt ${this.connectAttempts + 1}/${RoomClient.MAX_CONNECT_ATTEMPTS} -> ${this.opts.signalingUrl}`);
     const ws = new WebSocket(this.opts.signalingUrl);
     this.ws = ws;
 
     ws.onopen = () => {
       this.socketOpened = true;
+      this.log("WebSocket OPEN — sending join");
       this.send({ type: "join", room: this.opts.room, user: this.opts.user });
     };
     ws.onmessage = (ev) => this.onMessage(JSON.parse(ev.data) as ServerMessage);
     // onerror always precedes onclose; let onclose decide retry vs. fail.
-    ws.onerror = () => {};
-    ws.onclose = () => {
+    ws.onerror = () => this.log("WebSocket error event");
+    ws.onclose = (ev) => {
+      this.log(`WebSocket closed (code=${ev.code}, reason="${ev.reason}", wasClean=${ev.wasClean}, everOpened=${this.socketOpened})`);
       if (this.leaving) return;
 
       if (this.socketOpened) {
@@ -210,6 +226,7 @@ export class RoomClient {
         }, RoomClient.RETRY_DELAY_MS);
         return;
       }
+      this.log("giving up — exhausted connect attempts");
       this.fail("Couldn't reach the signaling server.");
     };
   }

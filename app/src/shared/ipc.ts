@@ -14,10 +14,21 @@ export interface KootaniApi {
   getConfig(): Promise<KootaniConfig>;
   googleLogin(): Promise<UserInfo>;
   copyText(text: string): Promise<void>;
-  /** Start the in-app signaling server + tunnel; resolves with the public wss URL. */
-  startHosting(): Promise<{ url: string }>;
+  /**
+   * Start the in-app signaling server + tunnel. Resolves with:
+   *  - `url`: the public `wss://…trycloudflare.com` address to put in invite links
+   *    (what friends connect to, from the outside internet).
+   *  - `localUrl`: `ws://127.0.0.1:<port>` — what *this* PC connects to. The host
+   *    must NOT reach its own server via the tunnel: routing out to Cloudflare's
+   *    edge and back to the same machine is both wasteful and unreliable (we've
+   *    observed the edge return HTTP 530 to the origin's own network while serving
+   *    every other network fine). Localhost is instant and always works.
+   */
+  startHosting(): Promise<{ url: string; localUrl: string }>;
   /** Tear down the in-app server + tunnel. */
   stopHosting(): Promise<void>;
   /** Subscribe to hosting progress messages. Returns an unsubscribe function. */
   onHostStatus(cb: (status: string) => void): () => void;
+  /** Fire-and-forget: append a line to the host diagnostics log (main process). */
+  log(message: string): void;
 }

@@ -3,6 +3,7 @@ import { app, BrowserWindow, clipboard, ipcMain, session, shell } from "electron
 import { googleLogin } from "./auth.js";
 import { loadConfig, type AppConfig } from "./config.js";
 import { startHosting, stopHosting } from "./hosting/index.js";
+import { hostLog } from "./hosting/logger.js";
 import type { UserInfo } from "../shared/protocol.js";
 
 // Resolved once the app is ready (loadConfig reads app.getAppPath()).
@@ -79,6 +80,10 @@ app.whenReady().then(() => {
     });
   });
   ipcMain.handle("host:stop", () => stopHosting());
+
+  // Renderer-side diagnostics (WebSocket connect attempts, close codes, retries)
+  // funnelled into the same host log so the whole picture is in one file.
+  ipcMain.on("host:log", (_e, message: string) => hostLog(`[renderer] ${message}`));
 
   createWindow();
 

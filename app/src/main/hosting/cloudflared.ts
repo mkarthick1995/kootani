@@ -10,10 +10,10 @@
  * a random URL per run — fine for on-demand game nights.
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { arch, platform } from "node:os";
-import { get as httpsGet } from "node:https";
+import { hostLog } from "./logger.js";
 
 function cloudflaredAsset(): { name: string; file: string } {
   const a = arch() === "arm64" ? "arm64" : "amd64";
@@ -29,7 +29,10 @@ function cloudflaredAsset(): { name: string; file: string } {
 export async function ensureCloudflared(dir: string): Promise<string> {
   const { name, file } = cloudflaredAsset();
   const dest = join(dir, file);
-  if (existsSync(dest)) return dest;
+  if (existsSync(dest)) {
+    hostLog(`cloudflared already present: ${dest} (${statSync(dest).size} bytes)`);
+    return dest;
+  }
 
   if (platform() === "darwin") {
     // The macOS asset is a .tgz; we only officially support a Windows host, so
@@ -39,9 +42,12 @@ export async function ensureCloudflared(dir: string): Promise<string> {
 
   mkdirSync(dir, { recursive: true });
   const url = `https://github.com/cloudflare/cloudflared/releases/latest/download/${name}`;
+  hostLog(`downloading cloudflared: ${url}`);
   const res = await fetch(url, { redirect: "follow" });
   if (!res.ok) throw new Error(`Couldn't download the tunnel helper (HTTP ${res.status}).`);
-  writeFileSync(dest, Buffer.from(await res.arrayBuffer()), { mode: 0o755 });
+  const bytes = Buffer.from(await res.arrayBuffer());
+  writeFileSync(dest, bytes, { mode: 0o755 });
+  hostLog(`downloaded cloudflared -> ${dest} (${bytes.length} bytes)`);
   return dest;
 }
 
@@ -70,14 +76,28 @@ const REGISTER_FALLBACK_MS = 6_000;
  */
 export function startTunnel(bin: string, port: number, onLog?: (line: string) => void): Promise<Tunnel> {
   return new Promise<Tunnel>((resolve, reject) => {
-    const child: ChildProcess = spawn(
-      bin,
-      // Use 127.0.0.1, not localhost: the server binds to IPv4 loopback, and on
-      // Windows "localhost" can resolve to ::1 (IPv6) first, which cloudflared
-      // then fails to reach.
-      ["tunnel", "--no-autoupdate", "--url", `http://127.0.0.1:${port}`],
-      { stdio: ["ignore", "pipe", "pipe"] },
-    );
+    // Use 127.0.0.1, not localhost: the server binds to IPv4 loopback, and on
+    // Windows "localhost" can resolve to ::1 (IPv6) first, which cloudflared
+    // then fails to reach.
+    //
+    // --protocol http2 + --edge-ip-version 4: cloudflared defaults to QUIC over
+    // UDP/7844, which restrictive home/office networks and some VPN adapters drop.
+    // HTTP/2 runs over plain TCP/443 (and IPv4 only), which traverses far more
+    // networks unchanged — important when friends connect from arbitrary ISPs. A
+    // reachability probe confirmed an http2 quick tunnel serves an external network
+    // end-to-end, so this is a proven-good configuration.
+    const args = [
+      "tunnel",
+      "--no-autoupdate",
+      "--protocol",
+      "http2",
+      "--edge-ip-version",
+      "4",
+      "--url",
+      `http://127.0.0.1:${port}`,
+    ];
+    hostLog(`spawning: "${bin}" ${args.join(" ")}`);
+    const child: ChildProcess = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
 
     let settled = false;
     let url: string | null = null;
@@ -124,53 +144,11 @@ export function startTunnel(bin: string, port: number, onLog?: (line: string) =>
     child.stdout?.on("data", scan);
     child.stderr?.on("data", scan); // cloudflared prints the URL to stderr
     child.on("error", (err) => finishErr(err));
-    child.on("exit", (code) => finishErr(new Error(`The tunnel helper exited unexpectedly (code ${code ?? "?"}).`)));
-  });
-}
-
-const ROUTABLE_TIMEOUT_MS = 45_000;
-const ROUTABLE_POLL_MS = 1_500;
-
-/**
- * cloudflared reports a connection "registered" before Cloudflare's edge has
- * actually published a route to it — so a client that connects immediately gets
- * a refused/reset socket (WebSocket close code 1006). This polls the tunnel's
- * own /health endpoint until it genuinely serves the local server, so we only
- * hand the URL to the UI once it's truly usable. Rejects after a timeout.
- */
-export function waitUntilRoutable(wssUrl: string, onLog?: (line: string) => void): Promise<void> {
-  const healthUrl = wssUrl.replace(/^wss:/, "https:") + "/health";
-  const deadline = Date.now() + ROUTABLE_TIMEOUT_MS;
-
-  return new Promise<void>((resolve, reject) => {
-    let tries = 0;
-
-    const attempt = (): void => {
-      tries++;
-      const req = httpsGet(healthUrl, { timeout: 6000 }, (res) => {
-        let body = "";
-        res.on("data", (d) => (body += d));
-        res.on("end", () => {
-          if (res.statusCode === 200 && body.includes("Kootani")) resolve();
-          else retry(`status ${res.statusCode}`);
-        });
-      });
-      req.on("error", (e) => retry(e.message));
-      req.on("timeout", () => {
-        req.destroy();
-        retry("request timeout");
-      });
-    };
-
-    const retry = (why: string): void => {
-      if (Date.now() >= deadline) {
-        reject(new Error("The tunnel didn't come online in time. Please try hosting again."));
-        return;
-      }
-      onLog?.(`tunnel not routable yet (try ${tries}: ${why})`);
-      setTimeout(attempt, ROUTABLE_POLL_MS);
-    };
-
-    attempt();
+    child.on("exit", (code, signal) => {
+      // If this fires AFTER we've resolved, the tunnel died mid-session — the
+      // process is gone, so the public URL goes dead. Log it either way.
+      hostLog(`[cloudflared] process exited (code=${code ?? "?"}, signal=${signal ?? "none"})`);
+      finishErr(new Error(`The tunnel helper exited unexpectedly (code ${code ?? "?"}).`));
+    });
   });
 }
