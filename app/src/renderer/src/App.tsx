@@ -6,6 +6,7 @@ import { decodeJoinLink, encodeJoinLink, normalizeWsUrl } from "./lib/joinlink";
 import { RemoteAudio } from "./components/RemoteAudio";
 import { ScreenVideo } from "./components/ScreenVideo";
 import { ScreenPicker } from "./components/ScreenPicker";
+import { QualityControls } from "./components/QualityControls";
 
 type Phase = "login" | "lobby" | "room";
 
@@ -396,7 +397,14 @@ function Room({
         </div>
       </header>
 
-      {picking && <ScreenPicker onPick={pickSource} onCancel={() => setPicking(false)} />}
+      {picking && (
+        <ScreenPicker
+          quality={snapshot.screenQuality}
+          onQualityChange={(q) => void client.setScreenQuality(q)}
+          onPick={pickSource}
+          onCancel={() => setPicking(false)}
+        />
+      )}
 
       <div className="invite-bar">
         <span className="field-label">Invite link</span>
@@ -426,6 +434,15 @@ function Room({
                 🖥 {share.label}
                 {share.id === "self" && <em> (your screen)</em>}
               </figcaption>
+              {share.id === "self" && (
+                <div className="screen-quality-bar">
+                  <QualityControls
+                    quality={snapshot.screenQuality}
+                    onChange={(q) => void client.setScreenQuality(q)}
+                    compact
+                  />
+                </div>
+              )}
             </figure>
           ))}
         </div>

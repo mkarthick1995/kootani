@@ -77,6 +77,66 @@ function saveSettings(s: MediaSettings): void {
   }
 }
 
+/** Screen-share quality: the capture height cap and frame rate. */
+export interface ScreenQuality {
+  /** Max captured height in px; width follows the source aspect ratio. */
+  maxHeight: number;
+  /** Captured frames per second. */
+  frameRate: number;
+}
+
+/** Resolution choices offered in the UI (height-based, the usual "Np" labels). */
+export const SCREEN_RESOLUTIONS: { label: string; height: number }[] = [
+  { label: "480p", height: 480 },
+  { label: "720p", height: 720 },
+  { label: "1080p (Full HD)", height: 1080 },
+  { label: "1440p (2K)", height: 1440 },
+  { label: "2160p (4K)", height: 2160 },
+];
+
+/** Frame-rate choices offered in the UI. */
+export const SCREEN_FRAME_RATES: number[] = [24, 30, 60, 120, 144];
+
+const SCREEN_KEY = "kootani.screenQuality";
+const DEFAULT_SCREEN_QUALITY: ScreenQuality = { maxHeight: 1080, frameRate: 30 };
+
+function loadScreenQuality(): ScreenQuality {
+  try {
+    const s = JSON.parse(localStorage.getItem(SCREEN_KEY) ?? "") as Partial<ScreenQuality>;
+    return {
+      maxHeight: typeof s.maxHeight === "number" ? s.maxHeight : DEFAULT_SCREEN_QUALITY.maxHeight,
+      frameRate: typeof s.frameRate === "number" ? s.frameRate : DEFAULT_SCREEN_QUALITY.frameRate,
+    };
+  } catch {
+    return { ...DEFAULT_SCREEN_QUALITY };
+  }
+}
+
+function saveScreenQuality(q: ScreenQuality): void {
+  try {
+    localStorage.setItem(SCREEN_KEY, JSON.stringify(q));
+  } catch {
+    /* storage may be unavailable; settings just won't persist */
+  }
+}
+
+/** getDisplayMedia/track constraints for a chosen quality. Capping height keeps
+ * the source aspect ratio (unlike fixing width too), so ultrawide/4:3 still fit. */
+function screenConstraints(q: ScreenQuality): MediaTrackConstraints {
+  return {
+    height: { ideal: q.maxHeight, max: q.maxHeight },
+    frameRate: { ideal: q.frameRate, max: q.frameRate },
+  };
+}
+
+/** A sensible encoder bitrate cap (bps) for a resolution/fps. WebRTC adapts
+ * *below* this as the link allows; without it, high-res frames look blocky. */
+function screenBitrate(q: ScreenQuality): number {
+  const width = Math.round((q.maxHeight * 16) / 9);
+  const raw = width * q.maxHeight * q.frameRate * 0.07; // ~0.07 bits/pixel for motion
+  return Math.min(25_000_000, Math.max(800_000, Math.round(raw)));
+}
+
 export interface PeerView {
   id: string;
   user: UserInfo;
@@ -104,6 +164,8 @@ export interface RoomSnapshot {
   sharing: boolean;
   /** This user's own shared-screen stream, for a local self-preview. */
   localScreenStream: MediaStream | null;
+  /** Current screen-share resolution/fps (applies to the next or live share). */
+  screenQuality: ScreenQuality;
   settings: MediaSettings;
   peers: PeerView[];
   error: string | null;
@@ -152,6 +214,7 @@ export class RoomClient {
   // audio) whose tracks are added to every peer connection while sharing.
   private screenStream: MediaStream | null = null;
   private sharing = false;
+  private screenQuality: ScreenQuality = loadScreenQuality();
 
   private status: RoomStatus = "connecting";
   private selfId: string | null = null;
@@ -305,8 +368,12 @@ export class RoomClient {
     if (this.sharing) return;
     let stream: MediaStream;
     try {
-      // audio: true picks up system/loopback audio so game sound is shared too.
-      stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+      // Capture at the chosen resolution/fps; audio:true picks up system/loopback
+      // audio so game sound is shared too.
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: screenConstraints(this.screenQuality),
+        audio: true,
+      });
     } catch (err) {
       // Our own picker (not the OS one) chose the source, so this is a real
       // capture failure rather than a user cancel — record it for diagnostics.
@@ -315,9 +382,32 @@ export class RoomClient {
     }
     this.screenStream = stream;
     this.sharing = true;
-    // Stopping via Windows' own "stop sharing" overlay ends the track — mirror that.
-    stream.getVideoTracks()[0]?.addEventListener("ended", () => this.stopScreenShare());
+    // Hint the encoder this is fast-moving content (games), favouring frame rate.
+    const video = stream.getVideoTracks()[0];
+    if (video) {
+      video.contentHint = "motion";
+      video.addEventListener("ended", () => this.stopScreenShare()); // Windows overlay "stop"
+    }
     for (const ps of this.peers.values()) this.addScreenTracks(ps);
+    this.emit();
+  }
+
+  /**
+   * Change screen-share resolution/fps. Persists the choice; if a share is live,
+   * re-applies the capture constraints and encoder bitrate without renegotiating.
+   */
+  async setScreenQuality(quality: ScreenQuality): Promise<void> {
+    this.screenQuality = quality;
+    saveScreenQuality(quality);
+    const video = this.screenStream?.getVideoTracks()[0];
+    if (this.sharing && video) {
+      try {
+        await video.applyConstraints(screenConstraints(quality));
+      } catch (err) {
+        this.log(`applyConstraints (screen) failed: ${String(err)}`);
+      }
+      for (const ps of this.peers.values()) this.tuneScreenSender(ps.pc);
+    }
     this.emit();
   }
 
@@ -337,11 +427,28 @@ export class RoomClient {
     this.emit();
   }
 
-  /** Add the current screen tracks to one peer and tell them a share is starting. */
+  /** Add the current screen tracks to one peer, set the bitrate, and announce it. */
   private addScreenTracks(ps: PeerState): void {
     if (!this.screenStream) return;
     this.screenStream.getTracks().forEach((t) => ps.pc.addTrack(t, this.screenStream!));
+    this.tuneScreenSender(ps.pc);
     this.sendSignal(ps.info.id, { kind: "screen", on: true });
+  }
+
+  /** Cap the screen video sender's bitrate for the chosen quality, and let it
+   * shed resolution before frame rate under congestion (smoother for games). */
+  private async tuneScreenSender(pc: RTCPeerConnection): Promise<void> {
+    const sender = pc.getSenders().find((s) => s.track?.kind === "video");
+    if (!sender) return;
+    try {
+      const params = sender.getParameters();
+      if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
+      params.encodings[0].maxBitrate = screenBitrate(this.screenQuality);
+      params.degradationPreference = "maintain-framerate";
+      await sender.setParameters(params);
+    } catch {
+      // setParameters isn't always available; quality just falls back to default.
+    }
   }
 
   // -- audio controls (all local to this user) ------------------------------
@@ -632,6 +739,7 @@ export class RoomClient {
       muted: this.muted,
       sharing: this.sharing,
       localScreenStream: this.screenStream,
+      screenQuality: { ...this.screenQuality },
       settings: { ...this.settings },
       peers,
       error: this.error,

@@ -1,15 +1,21 @@
 import { useEffect, useState } from "react";
 import type { ScreenSource } from "@shared/ipc";
+import type { ScreenQuality } from "../lib/RoomClient";
+import { QualityControls } from "./QualityControls";
 
 /**
  * Modal that lists shareable screens/windows (Electron has no native picker on
- * Windows, so we render our own). Calls onPick with the chosen source id, or
- * onCancel if dismissed.
+ * Windows, so we render our own), plus resolution/fps controls. Calls onPick with
+ * the chosen source id, or onCancel if dismissed.
  */
 export function ScreenPicker({
+  quality,
+  onQualityChange,
   onPick,
   onCancel,
 }: {
+  quality: ScreenQuality;
+  onQualityChange: (q: ScreenQuality) => void;
   onPick: (sourceId: string) => void;
   onCancel: () => void;
 }): JSX.Element {
@@ -43,6 +49,10 @@ export function ScreenPicker({
           <button className="link picker-close" onClick={onCancel}>
             ✕
           </button>
+        </div>
+
+        <div className="picker-quality">
+          <QualityControls quality={quality} onChange={onQualityChange} />
         </div>
 
         {error && <p className="error">{error}</p>}

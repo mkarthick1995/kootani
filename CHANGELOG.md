@@ -3,6 +3,18 @@
 All notable changes to Kootani. Versions refer to the packaged app
 (`app/package.json`).
 
+## [0.3.1] — 2026-05-28
+
+### Added
+- **Screen-share quality controls.** Pick the capture **resolution** (480p, 720p,
+  1080p, 1440p/2K, 2160p/4K) and **frame rate** (24, 30, 60, 120, 144 fps) — in
+  the picker before sharing, or live on your own preview tile while sharing
+  (changes apply instantly, no reconnection). The choice is remembered.
+  - The encoder's max bitrate now scales with the chosen resolution/fps (WebRTC
+    still adapts below it), so high-res/high-fps shares stay sharp instead of
+    blocky, and the screen sender sheds resolution before frame rate under
+    congestion (smoother for fast-moving games).
+
 ## [0.3.0] — 2026-05-28
 
 ### Added

@@ -538,6 +538,60 @@ input[type="range"] {
   font-style: normal;
   font-weight: 400;
 }
+/* Live resolution/fps controls on the sharer's own preview tile. */
+.screen-quality-bar {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  background: rgba(0, 0, 0, 0.6);
+  border-radius: 8px;
+  padding: 6px 8px;
+}
+
+/* Resolution / frame-rate dropdowns */
+.quality-controls {
+  display: flex;
+  gap: 14px;
+}
+.quality-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.quality-controls.compact {
+  gap: 8px;
+}
+.quality-controls.compact .quality-field {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  color: var(--text);
+}
+.select {
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: #1c1f28;
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+}
+.select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.quality-controls.compact .select {
+  padding: 4px 6px;
+  font-size: 12px;
+}
+.picker-quality {
+  margin-top: 12px;
+  padding: 12px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
 
 /* Screen sharing — picker modal */
 .modal-backdrop {
