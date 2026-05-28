@@ -16,6 +16,7 @@ the [README](../README.md); for fixes to specific problems, see
 - [One-click hosting](#one-click-hosting)
 - [Invite links](#invite-links)
 - [Audio pipeline](#audio-pipeline)
+- [Screen sharing](#screen-sharing)
 - [Authentication](#authentication)
 - [Security model](#security-model)
 - [Packaging & distribution](#packaging--distribution)
@@ -117,23 +118,39 @@ Defined in `server/src/protocol.ts` and mirrored in `app/src/shared/protocol.ts`
 | `pong` | — | heartbeat reply |
 
 The `data` inside `signal` is opaque to the server. On the client it's a
-`SignalData` (`{ kind: "sdp" | "ice", … }`), defined in `RoomClient.ts` because
-it uses DOM-only WebRTC types.
+`SignalData` (`{ kind: "sdp" | "ice" | "screen", … }`), defined in `RoomClient.ts`
+because it uses DOM-only WebRTC types. The `"screen"` kind is a lightweight
+sharing-state flag — the screen pixels themselves travel as a normal video track
+inside SDP-negotiated media.
 
 ## WebRTC mesh & connection setup
 
 Topology is a **full mesh**: every pair of peers has one `RTCPeerConnection`.
 For ~6 people this is simpler and more robust than a central relay, and the host
-isn't burdened with forwarding everyone's audio.
+isn't burdened with forwarding everyone's audio (or screen pixels).
 
-**Glare-free offer rule:** the **joining** peer creates the offer to everyone
-already in the room; existing peers wait and answer. Because the server tells a
-newcomer exactly who's present (and notifies the others), there's exactly one
-offerer per pair — no offer collisions, so we don't need perfect-negotiation
-rollback.
+**Perfect negotiation.** Either side may now (re)negotiate at any time —
+adding or dropping a screen track fires `negotiationneeded` on whichever peer is
+sharing, so the old "newcomer always offers" rule no longer holds and offer
+glare is real. The mesh uses the MDN
+[perfect-negotiation pattern](https://developer.mozilla.org/docs/Web/API/WebRTC_API/Perfect_negotiation)
+to resolve it:
+
+- Each pair has a stable **polite/impolite** assignment, decided by a plain id
+  compare (`selfId > peerId` → polite). The two ends always disagree, which is
+  the whole point.
+- `pc.onnegotiationneeded` drives offers via `setLocalDescription()` with no
+  args (implicit offer when stable, implicit answer when remote offer is set).
+- On a collision (`desc.type === "offer" && (makingOffer || signalingState !== "stable")`),
+  the **impolite** peer ignores the incoming offer and keeps its own; the
+  **polite** peer accepts it, which implicitly rolls back its own in-flight offer.
+- A `screen:false` notification lets the receiver drop the share view promptly
+  even before the renegotiation that removes the track completes.
 
 ICE candidates that arrive before the remote description is set are buffered per
-peer and drained once it's applied.
+peer and drained once it's applied. Candidates that belong to an offer we
+deliberately ignored during a collision fail silently — `ignoreOffer` suppresses
+their log noise.
 
 **ICE servers** (`ICE_SERVERS` in `RoomClient.ts`): currently **STUN only**
 (Google's public STUN). STUN lets peers discover their public address, which is
@@ -239,6 +256,71 @@ getUserMedia({ echoCancellation, noiseSuppression, autoGainControl })  ← raw m
 
 All of this is **per user, local** — your settings never affect anyone else's stream.
 
+## Screen sharing
+
+Any room member can share a monitor or a single window; system/game audio rides
+along on Windows via loopback capture. Multiple shares can be live at once and
+are stacked on a "screen stage" above the participants. Implemented across three
+processes:
+
+```
+ renderer  ── prepareScreenShare(sourceId) ──►  main  (stash id)
+ renderer  ── getDisplayMedia({video, audio}) ──►  Electron session ──► setDisplayMediaRequestHandler
+                                                                          │
+                                                          desktopCapturer.getSources(...)
+                                                                          │
+                                                       callback({ video: match, audio: "loopback" })
+ renderer  ◄── MediaStream (video + system audio) ──┘
+ renderer  ── addTrack(...) to every RTCPeerConnection ──► remote peers
+ renderer  ── signal({ kind: "screen", on: true }) ──► remote peers (UI hint)
+```
+
+**No native picker on Windows.** Electron's `getDisplayMedia` has no built-in
+picker on Windows, so Kootani renders its own (`ScreenPicker.tsx`): a modal
+listing screens/windows resolved via `desktopCapturer.getSources` with
+thumbnails (data URLs) and app icons (`fetchWindowIcons: true`). The chosen id
+is stashed in the main process (`screen:prepare`) so that the very next
+`getDisplayMedia` call's `setDisplayMediaRequestHandler` can return it. Without
+a stashed id the handler denies the request.
+
+**Capture quality is a ceiling, not a floor.** The picker (and a live control
+on the self-preview tile) lets users set a height-based **resolution** (480p,
+720p, 1080p, 1440p/2K, 2160p/4K) and a **frame rate** (24/30/60/120/144 fps).
+These map to `getDisplayMedia` track constraints (`height`/`frameRate`,
+`ideal`+`max`) and, on a live change, to `track.applyConstraints` — no
+renegotiation needed. Height-capping keeps the source aspect ratio so
+ultrawide/4:3 displays still fit.
+
+**Encoder bitrate scales with the choice.** Resolution and frame rate alone
+aren't enough: a 4K/60 share encoded at the default bitrate looks blocky. The
+screen sender's `maxBitrate` is set proportional to `width × height × fps × 0.07`,
+clamped to 0.8–25 Mbps. The sender also runs with
+`degradationPreference: "maintain-framerate"` so under congestion it sheds
+resolution before frame rate — smoother for fast-moving games. The track's
+`contentHint = "motion"` nudges the encoder toward the same priority. WebRTC
+still adapts *below* this cap as the link allows.
+
+**Track classification on the receiver.** A peer can carry up to two streams
+(voice + screen). On `ontrack`, the receiver decides which by looking at the
+stream the sender attached the track to: a stream with any video tracks (or the
+arriving track itself being video) is the screen; an audio-only stream is voice
+— but only if no voice stream exists yet (or it's the same stream id). The
+guard exists because a screen's loopback audio track can arrive *before* its
+video, and without it a fresh screen-with-audio would briefly clobber the
+existing voice stream.
+
+**Stopping.** The user can stop via Kootani's button or Windows' own
+"Stop sharing" overlay; both end up at `stopScreenShare`, which removes the
+tracks from every `RTCPeerConnection` (firing `negotiationneeded` from this
+side), sends `{ kind: "screen", on: false }` so receivers drop the view at
+once, and stops the underlying tracks. The video track's `"ended"` event
+catches the Windows-overlay path.
+
+**Why not a single big stream?** Voice and screen live in independent
+`MediaStream`s with separate quality, lifecycle, and mute semantics. Mixing
+them would couple controls (e.g. live resolution changes shouldn't touch the
+mic) and complicate the multi-share UX.
+
 ## Authentication
 
 `app/src/main/auth.ts`. Google sign-in uses the **desktop OAuth flow**: the
@@ -257,11 +339,16 @@ A **nickname** login is always available for quick testing without Google setup.
 
 - **Renderer is sandboxed:** `contextIsolation: true`, `nodeIntegration: false`.
   The renderer talks to the main process only through a minimal `window.kootani`
-  bridge (`getConfig`, `googleLogin`, `copyText`).
+  bridge (`getConfig`, `googleLogin`, `copyText`, hosting, and screen-source
+  enumeration/preparation).
 - **CSP** in `index.html` restricts sources; `connect-src` allows `ws:`/`wss:`/
   `https:` for the tunnel and avatars.
-- **Permissions:** the session grants only the `media` permission (mic); all
-  others are denied.
+- **Permissions:** the session grants only `media` (mic, for `getUserMedia`)
+  and `display-capture` (screen share, for `getDisplayMedia`); all others are
+  denied. `getDisplayMedia` itself is also gated by our own
+  `setDisplayMediaRequestHandler`, which denies the request unless the
+  renderer has just called `screen:prepare` with a valid source id from our
+  in-app picker.
 - **Clipboard** goes through Electron's native clipboard via IPC (the browser
   Clipboard API is unreliable under these locked-down permissions).
 - **The Google client secret is bundled in the `.exe`.** For an installed desktop
@@ -296,5 +383,14 @@ electron-builder --win`).
   ownership, but the signaling server stays on the PC that started hosting — so if
   that person quits, the session ends for everyone. Truly portable hosting would
   mean the new host starts their own tunnel and migrating peers to it.
-- **No video yet.** Deferred until voice is proven across the whole group; the
-  mesh and `PeerView.stream` plumbing already anticipate a second media track.
+- **Full-mesh upload scales with viewers.** A screen sender's upload bandwidth
+  is roughly `bitrate × (peers − 1)` — the price of a server-less mesh. For ~6
+  friends at 1080p/30 this is fine on a typical home upload; 4K/60 to five
+  viewers will saturate most consumer uplinks. Drop the quality, or wait for
+  an SFU-style relay (not currently planned for the cost reasons).
+- **Screen share is Windows-tested only.** Loopback system audio uses Electron's
+  `audio: "loopback"`, which is a Windows path; macOS/Linux capture would need
+  different plumbing. Kootani targets Windows today.
+- **No webcam video.** Screen sharing is in; a per-person camera tile is on the
+  roadmap. The mesh already carries two media streams per peer (voice + screen),
+  so a third would extend the same `PeerView` plumbing.

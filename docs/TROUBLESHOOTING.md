@@ -97,6 +97,88 @@ The peer appears and may even show "connected", but silence.
 
 ---
 
+## Screen share: the picker is empty / has no windows
+
+The picker lists what `desktopCapturer` reports. If you see only "Screen 1" and
+no windows:
+
+- Some apps render to surfaces the OS doesn't expose to screen capture
+  (fullscreen-exclusive games, certain DRM-protected video players). Share the
+  **whole screen** instead, or run the game in **borderless windowed** mode.
+- A few seconds after opening the picker, thumbnails refresh; if a window opened
+  after the picker, close and reopen the picker.
+
+---
+
+## Screen share: viewers see a black frame / nothing
+
+The video track negotiated but the picture never appears on the other end.
+
+- **Wait a few seconds.** WebRTC sometimes needs a moment to deliver the first
+  keyframe across a fresh peer connection, especially on slower links.
+- **Drop the quality.** A 4K/60 share to a viewer on a weak link can stall
+  before the first frame arrives. Use the resolution/fps controls on your
+  self-preview tile to switch to 720p/30 and the viewer should pick it up.
+- **Shared the wrong source.** If you shared a window that's since been
+  minimised, the OS may stop producing frames. Re-share the whole screen, or
+  bring the window back.
+- **Hardware-accelerated content (DRM/fullscreen-exclusive).** Some content is
+  drawn in a layer screen capture can't read — the share is black even though
+  the connection is fine. Share a different window/screen, or switch the source
+  app out of fullscreen-exclusive mode.
+
+---
+
+## Screen share: no game/system audio is reaching the other side
+
+Kootani uses Windows loopback (`audio: "loopback"`) to capture system audio
+alongside the chosen screen/window, so game sound rides on the share.
+
+- **Sharing a single window?** Loopback captures the whole system mix, not a
+  per-window stream — that part is OS-limited. The audio still goes out; just
+  expect to hear *everything* coming out of your speakers, not only that one
+  app.
+- **Output device that bypasses the mixer** (some USB headsets in "exclusive"
+  mode, certain virtual audio devices) won't be captured. Switch the OS output
+  to your normal speakers/headphones for the duration of the share, or disable
+  exclusive-mode on the device.
+- **Friend has no voice + screen audio**, only one or the other? That's a
+  rendering bug, not a capture one — report it; the `RoomClient.ts` ontrack
+  classifier is the place to look.
+
+---
+
+## Screen share: quality looks blocky / drops to a slideshow
+
+Kootani's "Resolution" and "Frame rate" controls set a **capture ceiling and an
+encoder bitrate target**; WebRTC adapts *below* this as your upload and the
+viewer's downlink allow.
+
+- **Blocky-but-smooth** → encoder is hitting its bitrate cap. Pick a smaller
+  resolution (1080p instead of 1440p, say) — fewer pixels at the same bitrate
+  means each one gets more bits.
+- **Sharp-but-stuttery** → frames are being dropped. Pick a lower frame rate
+  (30 instead of 60), or accept the resolution drop the encoder is already
+  doing; Kootani biases toward maintaining frame rate.
+- **In a full mesh your upload is `bitrate × (viewers − 1)`.** Sharing 4K/60
+  to five viewers on a typical home upload won't fit. The controls are there
+  precisely so you can right-size for the room.
+
+---
+
+## Screen share: my friend keeps seeing my old share after I stopped
+
+Stopping (via Kootani's button or Windows' "Stop sharing" overlay) sends a
+`screen:false` notification so the view drops immediately, then renegotiates to
+remove the track. If the view lingers:
+
+- Check the host log (`%APPDATA%\@kootani\app\kootani-host.log`) — both sides
+  log `RoomClient` errors. A failed renegotiation usually points to it.
+- Leaving and rejoining the room is the surest reset; the receiver's stale
+  `PeerView.screenStream` is cleared on `peer-left`.
+
+---
+
 ## Google sign-in: "Access blocked / app not verified"
 
 Your OAuth consent screen is in **Testing** mode and the signing-in account isn't

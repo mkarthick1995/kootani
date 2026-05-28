@@ -13,6 +13,10 @@ manage, no servers to rent, no cost.
 ## Features
 
 - 🎙️ **Live group voice** over WebRTC (peer-to-peer mesh, low latency).
+- 🖥️ **Screen sharing** — share a whole monitor or a single window, with system
+  /game audio riding along (Windows loopback). Pick **resolution** (480p →
+  2160p/4K) and **frame rate** (24–144 fps), changeable live while sharing.
+  Anyone in the room can share; multiple shares appear side by side.
 - 🖱️ **One-click hosting** — "Host a new room" turns your PC into the backend
   automatically (signaling server + secure tunnel); no setup, no terminal.
 - 🌍 **Works across the internet** — friends in different countries, no VPN, no
@@ -24,8 +28,6 @@ manage, no servers to rent, no cost.
   gain, mic input volume, and a per-person output volume. All live, all saved.
 - 📦 **One portable `.exe`** — friends double-click; nothing else to install.
 - 💸 **$0 to run** — no cloud bill, no credit card.
-
-> Video sharing is planned but intentionally deferred until voice is rock-solid.
 
 ---
 
@@ -171,18 +173,27 @@ kootani/
 ├── app/                         Electron client (React + TypeScript)
 │   ├── src/
 │   │   ├── main/                main process
-│   │   │   ├── index.ts         window, permissions, IPC, config
+│   │   │   ├── index.ts         window, permissions, IPC, config,
+│   │   │   │                    display-media handler + desktopCapturer
 │   │   │   ├── auth.ts          Google OAuth (system browser + PKCE)
 │   │   │   ├── config.ts        config loader
 │   │   │   └── hosting/         one-click hosting: embedded server + tunnel
+│   │   │       ├── index.ts     orchestration + lifecycle
+│   │   │       ├── signaling.ts in-process WebSocket signaling server
+│   │   │       ├── cloudflared.ts  cloudflared download + tunnel start
+│   │   │       └── logger.ts    host diagnostics log
 │   │   ├── preload/index.ts     contextBridge → window.kootani
 │   │   ├── renderer/            React UI
 │   │   │   └── src/
-│   │   │       ├── App.tsx              login → lobby → room
-│   │   │       ├── lib/RoomClient.ts    WebRTC mesh + audio pipeline
-│   │   │       ├── lib/joinlink.ts      invite-link encode/decode
-│   │   │       └── components/RemoteAudio.tsx
-│   │   └── shared/              protocol.ts (wire messages), ipc.ts
+│   │   │       ├── App.tsx                          login → lobby → room
+│   │   │       ├── lib/RoomClient.ts                WebRTC mesh, audio + screen
+│   │   │       ├── lib/joinlink.ts                  invite-link encode/decode
+│   │   │       └── components/
+│   │   │           ├── RemoteAudio.tsx              per-peer audio + volume
+│   │   │           ├── ScreenVideo.tsx              <video> with srcObject
+│   │   │           ├── ScreenPicker.tsx             in-app screens/windows picker
+│   │   │           └── QualityControls.tsx          resolution/fps dropdowns
+│   │   └── shared/              protocol.ts (wire messages), ipc.ts (incl. screen:* IPC)
 │   ├── electron-builder.yml     packaging config (portable target)
 │   ├── electron.vite.config.ts
 │   └── kootani.config.json      (gitignored) Google creds + defaults
@@ -224,6 +235,8 @@ kootani/
 - ✅ Portable `.exe` packaging.
 - ✅ Per-user audio controls (echo/noise/gain/volumes), persisted.
 - ✅ **One-click hosting** — server + tunnel embedded in the app (no `npm run host`).
+- ✅ **Screen sharing** with system/game audio, in-app picker, multiple
+  concurrent shares, and live resolution/fps controls.
 - ⏭️ **TURN relay** — add a free relay for the minority of networks where direct
   peer-to-peer fails.
-- ⏸️ **Video sharing** — after voice is proven across the group.
+- ⏸️ **Webcam video** — a per-person camera tile (separate from screen share).
