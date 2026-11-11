@@ -3,6 +3,74 @@
 All notable changes to Kootani. Versions refer to the packaged app
 (`app/package.json`).
 
+## [0.4.0] — 2026-11-12
+
+A reliability and usability pass. **Everyone needs this build:** the signaling
+protocol changed, and a 0.4.0 host tells older builds to update (instead of a
+call that half-works).
+
+### Fixed
+- **Anyone who had the tunnel URL could crash the host's app** by sending the
+  JSON text `null` (an unchecked `msg.type` threw in the main process). The
+  server now validates every message, caps frame size (256 KB, was 100 MB) and
+  room size (10), and can't be taken down by bad input. The in-app server also
+  only allows the host's own room.
+- **A brief signaling drop ended the call.** The client never reconnected, and
+  the server treated any dropped socket as "left", so everyone tore down their
+  peer connections. See *Reconnect without dropping the call* below.
+- **Joins could leave a pair stuck on "Connecting…" forever.** Every join caused
+  an offer collision; the polite side's rollback of its *initial* offer could
+  leave Chromium's ICE agent with no candidates. The member already in the room
+  now waits for the newcomer's offer (with a watchdog fallback). 8/8 rejoin
+  rounds connected in testing.
+- Failed or dropped peer connections were never recovered; a lost offer could
+  deadlock negotiation. Now: ICE restart on `failed`/prolonged `disconnected`,
+  and unanswered offers are rolled back and retried.
+- No microphone (denied, missing) meant you couldn't join at all. You now join
+  listen-only with a banner and a "Try again".
+- An interrupted `cloudflared` download could be cached as a corrupt binary
+  forever, and the download had no timeout. Now streamed to a temp file, size
+  checked, 30 s stall timeout, and an unrunnable binary is re-downloaded.
+- The guest-side diagnostics log grew without bound; the host log was wiped on
+  every host attempt. One rotating `kootani.log` now.
+- Voice vs. screen streams are identified by stream id (sent in the SDP) rather
+  than guessed from track arrival order.
+- `npm run host`: tunnel now targets `127.0.0.1` with `--protocol http2`, like
+  the app (avoids the IPv6 `localhost` trap).
+
+### Added
+- **Reconnect without dropping the call.** Seats are held for 60 s after a
+  disconnect; the client detects dead links (heartbeat), reconnects with backoff
+  and resumes its seat. Peer connections — and voice — are untouched. Others see
+  you as "Reconnecting…", not gone.
+- **Tunnel auto-restart.** If the host's tunnel dies, a new one opens, the invite
+  link updates, and guests are moved to the new address automatically over a
+  per-peer WebRTC data channel.
+- **TURN relays from config, shared by the host.** `iceServers` in
+  `kootani.config.json` (bundled, or `%APPDATA%\Kootani\kootani.config.json` with
+  no rebuild); the host's server hands its relay list to every guest.
+- **Speaking indicators**, peers' **mute/deafen** badges, **ping** per peer (and
+  "relay" when relayed), and a "you're muted" hint when you talk while muted.
+- **Deafen**, **global hotkeys** (`Ctrl+Shift+M` mute, `Ctrl+Shift+D` deafen,
+  working while a game has focus), and join/leave/mute **sound cues** (toggle).
+- **Microphone and speaker selection**, hot-swappable without renegotiating, with
+  automatic fallback when a device is unplugged, and a mic test.
+- Screen share: **fullscreen** (double-click), per-share **volume**, and a
+  **"Share system audio" toggle** (loopback also captures friends' voices).
+- **Remembered sign-in**, cancellable Google sign-in, "Paste & join", forgiving
+  invite parsing (links inside chat text, line breaks), friendlier connection
+  states, a confirm before the host leaves (or quits) while friends are in the
+  room, version + "Open logs" in the UI.
+- Tests: `npm test` (signaling server over real sockets; invite links).
+
+### Changed
+- One signaling implementation (`server/src/signaling.ts`) and one protocol
+  definition, used by both the standalone and in-app servers — no hand-synced
+  copies.
+- Room UI: bottom control bar (mute, deafen, share, settings, leave), settings
+  drawer, clearer banners; the renderer is now `sandbox: true` and can't be
+  navigated away.
+
 ## [0.3.1] — 2026-05-28
 
 ### Added

@@ -21,6 +21,7 @@
   "include": [
     "src/renderer/src/**/*",
     "src/shared/**/*",
+    "../server/src/protocol.ts",
     "src/preload/index.d.ts"
   ]
 }

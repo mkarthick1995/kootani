@@ -1,6 +1,6 @@
 {
   "name": "@kootani/app",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "private": true,
   "description": "Kootani desktop client (Electron).",
   "main": "./out/main/index.js",
@@ -12,7 +12,8 @@
     "typecheck:node": "tsc -p tsconfig.node.json --noEmit",
     "typecheck:web": "tsc -p tsconfig.web.json --noEmit",
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
-    "dist": "electron-vite build && electron-builder --win"
+    "dist": "electron-vite build && electron-builder --win",
+    "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
     "react": "^18.3.1",

@@ -28,7 +28,15 @@ function decodeJwtPayload(jwt: string): Record<string, unknown> {
   return JSON.parse(json);
 }
 
+/** Aborts the sign-in currently waiting on the browser, if any. */
+let cancelPending: (() => void) | null = null;
+
+export function cancelGoogleLogin(): void {
+  cancelPending?.();
+}
+
 export async function googleLogin(clientId: string, clientSecret: string): Promise<UserInfo> {
+  cancelPending?.(); // only one sign-in at a time
   const codeVerifier = base64url(randomBytes(32));
   const codeChallenge = base64url(createHash("sha256").update(codeVerifier).digest());
   const state = base64url(randomBytes(16));
@@ -60,10 +68,12 @@ export async function googleLogin(clientId: string, clientSecret: string): Promi
       );
 
       if (error) {
-        reject(new Error(`Google returned: ${error}`));
+        abort(new Error(error === "access_denied" ? "Sign-in was cancelled in the browser." : `Google returned: ${error}`));
       } else if (returnedState !== state) {
-        reject(new Error("State mismatch — possible CSRF, aborting."));
+        abort(new Error("State mismatch — possible CSRF, aborting."));
       } else if (returnedCode) {
+        if (timeout) clearTimeout(timeout);
+        cancelPending = null;
         const addr = server.address() as AddressInfo;
         resolve({
           code: returnedCode,
@@ -73,7 +83,16 @@ export async function googleLogin(clientId: string, clientSecret: string): Promi
       }
     });
 
-    server.on("error", reject);
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    const abort = (err: Error): void => {
+      if (timeout) clearTimeout(timeout);
+      cancelPending = null;
+      server.close();
+      reject(err);
+    };
+    cancelPending = () => abort(new Error("Sign-in cancelled."));
+
+    server.on("error", (err) => abort(err));
     server.listen(0, "127.0.0.1", () => {
       const addr = server.address() as AddressInfo;
       const redirectUri = `http://127.0.0.1:${addr.port}`;
@@ -88,14 +107,14 @@ export async function googleLogin(clientId: string, clientSecret: string): Promi
         state,
         prompt: "select_account",
       }).toString();
-      void shell.openExternal(authUrl.toString());
+      shell.openExternal(authUrl.toString()).catch(() =>
+        abort(new Error("Couldn't open your web browser for sign-in.")),
+      );
     });
 
     // Don't hang forever if the user abandons the browser.
-    setTimeout(() => {
-      server.close();
-      reject(new Error("Sign-in timed out."));
-    }, 300_000).unref();
+    timeout = setTimeout(() => abort(new Error("Sign-in timed out.")), 300_000);
+    timeout.unref();
   });
 
   try {

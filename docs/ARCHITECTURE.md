@@ -11,6 +11,7 @@ the [README](../README.md); for fixes to specific problems, see
 - [The signaling server](#the-signaling-server)
 - [The signaling protocol](#the-signaling-protocol)
 - [WebRTC mesh & connection setup](#webrtc-mesh--connection-setup)
+- [Reliability](#reliability)
 - [Host role & transfer](#host-role--transfer)
 - [Reaching a home PC: the tunnel](#reaching-a-home-pc-the-tunnel)
 - [One-click hosting](#one-click-hosting)
@@ -61,7 +62,7 @@ Three independently understandable parts:
 | Part | Lives in | Runtime | Role |
 | --- | --- | --- | --- |
 | Client | `app/` | Electron (Chromium + Node) | UI, WebRTC, sign-in |
-| Signaling server | in-app (`app/src/main/hosting/`); standalone copy in `server/` | Node + `ws` | rendezvous, room & host state |
+| Signaling server | `server/src/signaling.ts` — run in-app when hosting, or standalone via `server/` | Node + `ws` | rendezvous, room & host state |
 | Tunnel | in-app (`app/src/main/hosting/`); or `scripts/host.mjs` | `cloudflared` child process | makes the host PC reachable |
 
 When you click **Host a new room**, the client runs the signaling server and the
@@ -70,58 +71,86 @@ tunnel itself (see [One-click hosting](#one-click-hosting)). The standalone
 
 ## The signaling server
 
-`server/src/index.ts` — a WebSocket server on an HTTP server (so it can also
-answer `GET /health`). State is **in-memory and ephemeral**: a room exists only
-while someone is in it.
+**One implementation:** `server/src/signaling.ts` (`createSignalingServer(options)`)
+is used both by the standalone server (`server/src/index.ts`) and by the server
+embedded in the app (`app/src/main/hosting/signaling.ts`, a thin wrapper). The
+protocol types live once, in `server/src/protocol.ts`; `app/src/shared/protocol.ts`
+re-exports them. Nothing is kept in sync by hand any more.
+
+A WebSocket server on an HTTP server (so it can also answer `GET /health` with
+`{ ok, protocol, rooms }`). State is **in-memory and ephemeral**: a room exists
+only while someone is in it.
 
 ```
 rooms: Map<roomId, {
   hostId: string,
-  members: Map<memberId, { ws, user, isAlive }>   // insertion order matters
+  members: Map<memberId, {          // insertion order matters
+    user, token,                     // token: secret for resuming the seat
+    ws | null,                       // null = "away" (seat held)
+    queue: ServerMessage[],          // messages that arrived while away
+    graceTimer
+  }>
 }>
 ```
 
-- A connection may be in one room at a time (tracked via a `WeakMap<ws, …>`).
-- Joining a non-existent room **creates** it and makes you host.
-- A 15-second ping/pong heartbeat culls half-open connections (e.g. a slept
-  laptop) so host auto-transfer actually fires instead of leaving a ghost host.
-- `EADDRINUSE` is caught and reported as a friendly message, not a stack trace.
+- **Seats survive disconnects.** When a socket drops without a `leave`, the
+  member becomes *away* (others get `peer-status { away: true }`), messages to
+  them are queued, and the seat is held for a **60 s grace period**. Rejoining
+  with `resume: { memberId, token }` reclaims the same id, flushes the queue, and
+  nobody sees a `peer-left` — so their WebRTC connections, and the voice on
+  them, are never torn down by a signaling blip. Only when the grace period
+  expires is the member removed (and the host role moved, if needed).
+- **Joining a non-existent room creates it** and makes you host.
+- A 15-second ping/pong heartbeat culls half-open sockets (e.g. a slept laptop)
+  so their grace period starts.
+- **Untrusted input.** The embedded server is reachable from the internet
+  through the tunnel, so every message is validated (shape, types, lengths,
+  room-code charset, https-only avatars); frames over 256 KB are refused; a
+  malformed message gets an `error` reply and can never throw out of the handler.
+  Rooms are capped at 10 (full mesh).
+- **`lockToFirstRoom`** (embedded server): only the host's room can exist, so
+  someone who discovers the tunnel URL can't use the host's PC to run rooms of
+  their own.
+- `EADDRINUSE` is reported as a friendly message, not a stack trace.
 
-The server only relays; it never inspects or stores media.
+The server only relays; it never inspects or stores media. Tests:
+`server/test/signaling.test.ts` (real sockets — `npm test`).
 
 ## The signaling protocol
 
-Defined in `server/src/protocol.ts` and mirrored in `app/src/shared/protocol.ts`
-(kept in sync by hand — it's small and stable). All messages are JSON with a
-`type` discriminator.
+All messages are JSON with a `type` discriminator. `PROTOCOL_VERSION` is **2**;
+the server rejects older clients (`version` absent or < `MIN_PROTOCOL_VERSION`)
+with a fatal, human-readable "out of date" error instead of a half-working call.
 
 **Client → Server**
 
 | Type | Payload | Meaning |
 | --- | --- | --- |
-| `join` | `room`, `user` | join/create a room |
-| `leave` | — | leave cleanly |
-| `signal` | `to`, `data` | relay an SDP/ICE blob to one peer |
+| `join` | `room`, `user`, `version`, `resume?` | join/create a room, or reclaim a held seat |
+| `leave` | — | leave cleanly (no grace period) |
+| `signal` | `to`, `data` | relay an SDP/ICE blob to one peer (queued if they're away) |
 | `transfer-host` | `to` | (host only) hand off the host role |
-| `ping` | — | heartbeat |
+| `ping` | — | app-level heartbeat (the client uses the replies to detect a dead link) |
 
 **Server → Client**
 
 | Type | Payload | Meaning |
 | --- | --- | --- |
-| `joined` | `selfId`, `room`, `hostId`, `peers[]` | you're in; here's who's present |
+| `joined` | `selfId`, `room`, `hostId`, `peers[]`, `token`, `resumed`, `iceServers?` | you're in; who's present; your resume secret; TURN servers shared by the host |
 | `peer-joined` | `peer` | someone arrived |
-| `peer-left` | `peerId` | someone left |
+| `peer-left` | `peerId` | someone left (or their grace period expired) |
+| `peer-status` | `peerId`, `away` | someone's signaling link dropped / came back |
 | `signal` | `from`, `data` | an SDP/ICE blob from a peer |
 | `host-changed` | `hostId` | host role moved |
-| `error` | `message` | non-fatal error (e.g. failed transfer) |
+| `error` | `message`, `code?`, `fatal?` | `fatal` = don't retry (outdated client, room full, no such room) |
 | `pong` | — | heartbeat reply |
 
 The `data` inside `signal` is opaque to the server. On the client it's a
 `SignalData` (`{ kind: "sdp" | "ice" | "screen", … }`), defined in `RoomClient.ts`
-because it uses DOM-only WebRTC types. The `"screen"` kind is a lightweight
-sharing-state flag — the screen pixels themselves travel as a normal video track
-inside SDP-negotiated media.
+because it uses DOM-only WebRTC types. Every `sdp` also carries
+`streams: { voice, screen }` — the sender's stream ids — so the receiver knows
+exactly which incoming stream is which. The `"screen"` kind is a lightweight
+sharing-state flag; the pixels travel as a normal negotiated video track.
 
 ## WebRTC mesh & connection setup
 
@@ -129,10 +158,18 @@ Topology is a **full mesh**: every pair of peers has one `RTCPeerConnection`.
 For ~6 people this is simpler and more robust than a central relay, and the host
 isn't burdened with forwarding everyone's audio (or screen pixels).
 
-**Perfect negotiation.** Either side may now (re)negotiate at any time —
-adding or dropping a screen track fires `negotiationneeded` on whichever peer is
-sharing, so the old "newcomer always offers" rule no longer holds and offer
-glare is real. The mesh uses the MDN
+**The newcomer makes the first offer.** When someone joins, the members already
+in the room create their side of the connection but hold their own offer
+(`awaitingOffer`) and answer the newcomer's. Without this, *every* join was an
+offer collision, and resolving it meant the polite side rolled back its
+*initial* offer — which in testing left Chromium's ICE agent stuck with no
+candidates (connection forever "new"). If the newcomer's offer never arrives,
+the watchdog offers instead after 5 s.
+
+**Perfect negotiation for everything after that.** Either side may
+(re)negotiate at any time — adding or dropping a screen track fires
+`negotiationneeded` on whichever peer is sharing — so later glare is real. The
+mesh uses the MDN
 [perfect-negotiation pattern](https://developer.mozilla.org/docs/Web/API/WebRTC_API/Perfect_negotiation)
 to resolve it:
 
@@ -152,12 +189,33 @@ peer and drained once it's applied. Candidates that belong to an offer we
 deliberately ignored during a collision fail silently — `ignoreOffer` suppresses
 their log noise.
 
-**ICE servers** (`ICE_SERVERS` in `RoomClient.ts`): currently **STUN only**
-(Google's public STUN). STUN lets peers discover their public address, which is
-enough for many home networks. A **TURN** relay — needed when both ends are
-behind strict/symmetric NAT (common on Indian mobile/CGNAT) — is the planned next
-addition; it's a one-line config (`urls`/`username`/`credential`) using a free
-tier such as ExpressTURN.
+**ICE servers.** Built-in public STUN (Google, Cloudflare) lets peers discover
+their public address — enough for many home networks. A **TURN** relay, needed
+when both ends are behind strict/symmetric NAT (common on Indian mobile/CGNAT),
+comes from `iceServers` in `kootani.config.json`. Only the **host** needs it: the
+host's server includes its list in every `joined`, and each client merges it
+with its own. Malformed entries are dropped at load time (and logged).
+
+**Per-peer data channel.** Each connection also has a pre-negotiated
+`RTCDataChannel` (`negotiated: true, id: 0` — no extra signaling) carrying small
+P2P messages: `{ t: "state", muted, deafened }` (so tiles show who's muted) and
+`{ t: "server-moved", url }` (see [Reliability](#reliability)).
+
+## Reliability
+
+Failure is expected on home networks; each layer recovers on its own.
+
+| What breaks | How it's detected | What happens |
+| --- | --- | --- |
+| Signaling socket drops (Wi-Fi blip, sleep, tunnel hiccup) | `close` event, or no server message for 20 s (the client pings every 5 s) | Reconnect with backoff (0.5 s → 5 s) and **resume the seat**; signals sent meanwhile are queued and flushed. Peer connections — and voice — are untouched. Banner: "Reconnecting…". Gives up after 2 min (manual **Reconnect**). |
+| Seat expired (away > 60 s, or the server restarted) | `joined` with `resumed: false` | Close every peer connection and rebuild the mesh from scratch. |
+| Peer connection `failed`, or `disconnected` > 5 s | `connectionstatechange` + 1 s watchdog | `restartIce()` (rate-limited to once per 8 s); perfect negotiation handles the resulting offer. |
+| Our offer never answered (lost in a reconnect, ignored in a collision) | `have-local-offer` for > 15 s | Roll back, then ICE-restart to re-offer — negotiation can't deadlock. |
+| Host's tunnel process dies | `cloudflared` exits after it was up | Main process reopens a tunnel (retries at 1/4/10 s) → new URL. The host's invite link updates, and ~8 s later (edge propagation) the host sends `server-moved` over every data channel; guests switch their signaling URL and resume their seats there. |
+| Corrupt/blocked `cloudflared` | Binary under 5 MB, or spawn error | Delete it; re-download on the next attempt. Downloads stream to a temp file, renamed only when complete; a 30 s stall aborts. |
+| Mic denied / missing / unplugged | `getUserMedia` failure, track `ended` | Join **listen-only** (a silent track keeps the mesh uniform) with a banner + "Try again"; a vanished chosen mic falls back to the default. |
+| Bug in the main process | `uncaughtException` | Logged, not a crash dialog. |
+| Old build joins a new host | `version` in `join` | Fatal, friendly "out of date" error. |
 
 ## Host role & transfer
 
@@ -168,9 +226,13 @@ endpoint others dial.
 - **Manual transfer:** the host sends `transfer-host`; the server validates the
   sender is the current host and the target exists, updates `hostId`, and
   broadcasts `host-changed`. (UI: the host sees a "Make host" button on each peer.)
-- **Auto-transfer:** when the host disconnects (cleanly or abruptly, detected via
-  the heartbeat), the server promotes the **oldest remaining member** (first in
-  the insertion-ordered member map) and broadcasts `host-changed`.
+- **Auto-transfer:** when the host leaves cleanly, or drops and doesn't come back
+  within the 60 s grace period, the server promotes the **oldest remaining
+  member who is actually connected** (falling back to the oldest at all) and
+  broadcasts `host-changed`.
+- The *role* is room ownership; the *server* stays on the PC that started
+  hosting. That's why leaving as the hosting PC asks for confirmation — it ends
+  the room for everyone.
 
 ## Reaching a home PC: the tunnel
 
@@ -203,22 +265,25 @@ no pasting a tunnel URL, and no way to accidentally host on an unreachable
 `ws://localhost`. The renderer calls `window.kootani.startHosting()`; the main
 process then:
 
-1. **Starts the signaling server in-process** (`signaling.ts` —
-   `createSignalingServer(0)`), binding `127.0.0.1` on an **OS-assigned port**.
-   Port 0 means it can never collide, so the old `EADDRINUSE` problems are gone.
-   `ws` is bundled into the main-process build, so nothing extra ships.
+1. **Starts the signaling server in-process** (the shared core, wrapped by
+   `hosting/signaling.ts`), binding `127.0.0.1` on an **OS-assigned port** (no
+   `EADDRINUSE`, ever), locked to the host's one room, sharing the host's TURN
+   list. `ws` is bundled into the main-process build, so nothing extra ships.
 2. **Ensures `cloudflared`** (`cloudflared.ts` — `ensureCloudflared`), downloading
-   it once to `app.getPath("userData")/bin` (writable in a packaged build, unlike
-   the repo's `.cache/`).
-3. **Opens the tunnel** (`startTunnel`), parsing the `*.trycloudflare.com` URL
-   from cloudflared's output and resolving with the `wss://` form (with a timeout).
-4. Returns that URL; the lobby hosts a room at it and shows the invite link.
+   it once to `app.getPath("userData")/bin` with live progress, a stall timeout,
+   and an atomic temp-file-then-rename so a failed download is never cached.
+3. **Opens the tunnel** (`startTunnel`), resolving with the `wss://` form once
+   cloudflared reports a registered edge connection. One automatic retry; a
+   binary that can't execute is discarded for re-download.
+4. Returns `{ url, localUrl }`: friends get `url` in the invite; this PC connects
+   over `localUrl` (loopback — see the 0.2.1 changelog for why never via the
+   tunnel).
 
-Progress is streamed to the renderer over a `host:status` channel
-(`"Opening a secure tunnel…"`, etc.). Only one host session runs at a time, and
-it's torn down on room-leave and on `before-quit`. The same room/host/relay logic
-lives in both `signaling.ts` and the standalone `server/src/index.ts`; they're
-kept in sync by hand (the protocol is small and stable).
+Progress and later lifecycle events stream to the renderer on `host:event`
+(`status`, `tunnel-down`, `tunnel-up`, `tunnel-failed`). A double-click joins the
+in-flight attempt rather than starting a second server. Everything is torn down
+on room-leave and on quit — and quitting while friends are connected asks first
+("Closing Kootani disconnects 3 friends").
 
 ## Invite links
 
@@ -226,33 +291,46 @@ kept in sync by hand (the protocol is small and stable).
 session, the room code alone isn't enough — a guest also needs the server
 address. An **invite link** is `base64url(JSON({ u: url, r: room }))`: opaque
 enough to paste as one token, trivially decodable for debugging. The host copies
-it from the room's invite bar; the guest pastes it into "Join a friend's room".
-`normalizeWsUrl` coerces `http(s)`/bare-host inputs into `ws(s)://`.
+it from the room's invite bar; the guest pastes it into "Join a friend's room"
+(or clicks **Paste & join**). Decoding is forgiving — the link is found inside
+surrounding chat text, quotes, or line breaks — and validated (ws(s) URL, sane
+room code). It's UTF-8 safe. `normalizeWsUrl` coerces `http(s)`/bare-host inputs
+into `ws(s)://`. Tests: `app/test/joinlink.test.ts`.
 
 ## Audio pipeline
 
 In `RoomClient.connect()`:
 
 ```
-getUserMedia({ echoCancellation, noiseSuppression, autoGainControl })  ← raw mic track
+getUserMedia({ deviceId, echoCancellation, noiseSuppression, autoGainControl })  ← mic
         │
-   MediaStreamSource ─► GainNode (input volume) ─► MediaStreamDestination
-        │                                                   │
-   (raw track kept for live DSP toggles)        destination.stream ─► addTrack to every peer
+   MediaStreamSource ─► GainNode (input volume) ─┬─► MediaStreamDestination ─► addTrack to every peer
+        │                                         └─► AnalyserNode (speaking meter)
+   (raw track kept for live DSP toggles)
 ```
 
-- **DSP** (echo cancellation, noise suppression, auto gain) is set at capture and
-  toggled **live** via `track.applyConstraints(...)` — no renegotiation.
-- **Input volume** is a Web Audio `GainNode` (0–200%). Auto gain will fight a
-  manual setting, so turn it off for predictable manual control. If Web Audio
-  fails for any reason, we fall back to sending the raw mic stream.
-- **Output volume per peer** is the `<audio>` element's `.volume` (0–100%), set in
-  `RemoteAudio.tsx`. Purely local — it changes how *you* hear someone.
+- **The graph is built before the mic is opened**, so the destination's track
+  (what peers receive) exists even with no mic — it carries silence and the user
+  is **listen-only** rather than locked out. Switching microphones just swaps the
+  `MediaStreamSource`; peers keep the same track, so there's **no
+  renegotiation**. A chosen mic that disappears (unplugged) falls back to the
+  system default automatically.
+- **DSP** is set at capture and toggled **live** via `applyConstraints`.
+- **Input volume** is the `GainNode` (0–200%). If Web Audio fails, we fall back to
+  sending the raw mic track (swapped with `replaceTrack` on device change).
+- **Output device** (`setSinkId`) and **per-peer volume** (0–100%) are applied on
+  each peer's `<audio>` element (`RemoteAudio.tsx`); shared-screen audio has its
+  own per-share volume. **Deafen** mutes all of them and mutes the mic.
 - **Mute** disables the outgoing track (`track.enabled = false`).
-- **Bitrate**: the audio sender's `maxBitrate` is raised to ~64 kbps for clearer
-  Opus voice (default is ~32 kbps).
-- All mic settings persist in `localStorage` (`kootani.audioSettings`); per-peer
-  volumes are ephemeral.
+- **Speaking indicators.** Self: the analyser above (loudest ~21 ms chunk of a
+  ~170 ms window, every 100 ms). Peers: the receiver's cumulative
+  `totalAudioEnergy` / `totalSamplesDuration` from `getStats`, diffed every 150 ms
+  — an energy integral, so no speech falls between samples. (Two approaches that
+  *don't* work: the last RTP packet's `audioLevel` aliases badly, and Chromium
+  feeds Web Audio silence from remote WebRTC streams.)
+- **Bitrate**: the voice sender's `maxBitrate` is raised to ~64 kbps.
+- Settings persist in `localStorage` (`kootani.audioSettings`: DSP, input volume,
+  devices, sound cues, share-system-audio); per-peer volumes are ephemeral.
 
 All of this is **per user, local** — your settings never affect anyone else's stream.
 
@@ -301,13 +379,18 @@ resolution before frame rate — smoother for fast-moving games. The track's
 still adapts *below* this cap as the link allows.
 
 **Track classification on the receiver.** A peer can carry up to two streams
-(voice + screen). On `ontrack`, the receiver decides which by looking at the
-stream the sender attached the track to: a stream with any video tracks (or the
-arriving track itself being video) is the screen; an audio-only stream is voice
-— but only if no voice stream exists yet (or it's the same stream id). The
-guard exists because a screen's loopback audio track can arrive *before* its
-video, and without it a fresh screen-with-audio would briefly clobber the
-existing voice stream.
+(voice + screen). Every SDP the sender sends names its stream ids
+(`streams: { voice, screen }`), and the receiver keeps every incoming stream by
+id — so classification is exact regardless of the order tracks arrive in (a
+screen's loopback audio can arrive before its video). Heuristics (video ⇒
+screen, audio-only ⇒ voice) remain only as a fallback.
+
+**System audio is optional.** "Share system audio" in the picker (remembered)
+decides whether `screen:prepare` asks for `audio: "loopback"`. Loopback captures
+the *whole* system mix — including Kootani playing your friends' voices — so
+viewers on a share with system audio can hear themselves echoed. Turn it off
+when you don't need game sound. Viewers can **double-click a share for
+fullscreen**.
 
 **Stopping.** The user can stop via Kootani's button or Windows' own
 "Stop sharing" overlay; both end up at `stopScreenShare`, which removes the
@@ -333,14 +416,22 @@ mic) and complicate the multi-share UX.
    Google's token endpoint.
 4. Read identity (name/email/avatar) from the returned `id_token`.
 
-A **nickname** login is always available for quick testing without Google setup.
+A **nickname** login is always available without Google setup. The pending
+browser sign-in can be cancelled (the loopback server is closed). The signed-in
+identity (name/email/avatar — no tokens) is remembered in `localStorage`
+(`kootani.user`), so people don't sign in on every launch; **Sign out** forgets it.
 
 ## Security model
 
-- **Renderer is sandboxed:** `contextIsolation: true`, `nodeIntegration: false`.
-  The renderer talks to the main process only through a minimal `window.kootani`
-  bridge (`getConfig`, `googleLogin`, `copyText`, hosting, and screen-source
-  enumeration/preparation).
+- **Renderer is sandboxed:** `sandbox: true`, `contextIsolation: true`,
+  `nodeIntegration: false`. The renderer talks to the main process only through
+  a minimal `window.kootani` bridge (`shared/ipc.ts`). It can't navigate away
+  (`will-navigate` is blocked) and only `http(s)` links open externally.
+- **The signaling server treats all input as hostile** — see
+  [The signaling server](#the-signaling-server). Before 0.4.0, anyone with the
+  tunnel URL could crash the host's app by sending the JSON `null`.
+- **Resume tokens** are 24 random bytes, compared in constant time; a wrong token
+  just gets a fresh seat, never someone else's.
 - **CSP** in `index.html` restricts sources; `connect-src` allows `ws:`/`wss:`/
   `https:` for the tunnel and avatars.
 - **Permissions:** the session grants only `media` (mic, for `getUserMedia`)
@@ -376,9 +467,12 @@ electron-builder --win`).
 
 ## Known limitations & roadmap
 
-- **STUN-only.** Add a free TURN relay for networks where direct P2P fails.
+- **No TURN relay by default.** Supported (host-side config, shared with guests),
+  but you have to bring free credentials. Without one, a pair behind strict NATs
+  shows "Can't connect".
 - **Ephemeral tunnel URL.** Inherent to free quick tunnels; a stable address would
-  need a paid domain + named tunnel.
+  need a paid domain + named tunnel. A tunnel that dies mid-session is replaced
+  and guests are moved over automatically.
 - **Server runs on the original host's PC.** Host *role* transfer moves room
   ownership, but the signaling server stays on the PC that started hosting — so if
   that person quits, the session ends for everyone. Truly portable hosting would

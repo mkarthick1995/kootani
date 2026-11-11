@@ -13,6 +13,7 @@
     "host": "node scripts/host.mjs",
     "build:app": "npm run build --workspace app",
     "dist:app": "npm run dist --workspace app",
-    "typecheck": "npm run typecheck --workspace server && npm run typecheck --workspace app"
+    "typecheck": "npm run typecheck --workspace server && npm run typecheck --workspace app",
+    "test": "npm test --workspace server && npm test --workspace app"
   }
 }

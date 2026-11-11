@@ -21,11 +21,18 @@ manage, no servers to rent, no cost.
   automatically (signaling server + secure tunnel); no setup, no terminal.
 - 🌍 **Works across the internet** — friends in different countries, no VPN, no
   port-forwarding, via a free Cloudflare tunnel.
-- 🔑 **Google (Gmail) sign-in**, with a nickname fallback for quick testing.
+- 🛟 **Self-healing connections** — a dropped link reconnects and reclaims your
+  seat without interrupting voice; broken peer connections ICE-restart; a dead
+  tunnel is replaced and friends are moved to it automatically.
+- 🔑 **Google (Gmail) sign-in** or just a display name — remembered between launches.
 - 👑 **Host = room owner.** The creator hosts; the host can hand off the role,
   and if the host drops, it auto-transfers to another member.
-- 🎛️ **Per-user audio controls** — echo cancellation, noise suppression, auto
-  gain, mic input volume, and a per-person output volume. All live, all saved.
+- 🟢 **See who's talking** (speaking rings), who's muted/deafened, and each
+  person's ping — plus join/leave sounds.
+- 🎛️ **Per-user audio controls** — mic and speaker selection (hot-swappable),
+  echo cancellation, noise suppression, auto gain, mic volume with a mic test,
+  per-person volume, mute/deafen with **global hotkeys** (`Ctrl+Shift+M` /
+  `Ctrl+Shift+D`) that work while a game has focus.
 - 📦 **One portable `.exe`** — friends double-click; nothing else to install.
 - 💸 **$0 to run** — no cloud bill, no credit card.
 
@@ -137,15 +144,20 @@ What gets bundled (and why) is covered in
 
 ## Configuration
 
-Resolved in priority order: environment variables → `app/kootani.config.json` →
-defaults. The config file is **gitignored** (it holds the Google client secret).
+Resolved in priority order: environment variables → the user's
+`%APPDATA%\Kootani\kootani.config.json` (optional; no rebuild needed) → the
+bundled `app/kootani.config.json` → defaults. The bundled file is **gitignored**
+(it holds the Google client secret).
 
 | Setting | Env var | Config-file key | Default |
 | --- | --- | --- | --- |
 | Signaling URL (default for the address field) | `KOOTANI_SIGNALING_URL` | `signalingUrl` | `ws://localhost:8787` |
 | Google OAuth client ID | `KOOTANI_GOOGLE_CLIENT_ID` | `googleClientId` | — |
 | Google OAuth client secret | `KOOTANI_GOOGLE_CLIENT_SECRET` | `googleClientSecret` | — |
-| Signaling server port | `PORT` (server) | — | `8787` |
+| TURN relays (`[{ urls, username, credential }]`) — only the host needs them; they're shared with everyone who joins | — | `iceServers` | none |
+| Signaling server port / interface | `PORT`, `HOST` (server) | — | `8787`, all interfaces |
+
+See [TROUBLESHOOTING → Adding a TURN relay](docs/TROUBLESHOOTING.md#adding-a-turn-relay-for-cant-connect).
 
 `app/kootani.config.json` also accepts Google's downloaded `client_secret_*.json`
 shape verbatim (its `installed` block). When packaged, this file is bundled into
@@ -173,32 +185,36 @@ kootani/
 ├── app/                         Electron client (React + TypeScript)
 │   ├── src/
 │   │   ├── main/                main process
-│   │   │   ├── index.ts         window, permissions, IPC, config,
+│   │   │   ├── index.ts         window, permissions, IPC, hotkeys,
 │   │   │   │                    display-media handler + desktopCapturer
 │   │   │   ├── auth.ts          Google OAuth (system browser + PKCE)
-│   │   │   ├── config.ts        config loader
+│   │   │   ├── config.ts        config loader (bundled + user override)
+│   │   │   ├── logger.ts        rotating diagnostics log (kootani.log)
 │   │   │   └── hosting/         one-click hosting: embedded server + tunnel
-│   │   │       ├── index.ts     orchestration + lifecycle
-│   │   │       ├── signaling.ts in-process WebSocket signaling server
-│   │   │       ├── cloudflared.ts  cloudflared download + tunnel start
-│   │   │       └── logger.ts    host diagnostics log
+│   │   │       ├── index.ts     orchestration, lifecycle, tunnel auto-restart
+│   │   │       ├── signaling.ts wraps server/src/signaling.ts for in-app use
+│   │   │       └── cloudflared.ts  cloudflared download + tunnel start
 │   │   ├── preload/index.ts     contextBridge → window.kootani
 │   │   ├── renderer/            React UI
 │   │   │   └── src/
-│   │   │       ├── App.tsx                          login → lobby → room
-│   │   │       ├── lib/RoomClient.ts                WebRTC mesh, audio + screen
-│   │   │       ├── lib/joinlink.ts                  invite-link encode/decode
-│   │   │       └── components/
-│   │   │           ├── RemoteAudio.tsx              per-peer audio + volume
-│   │   │           ├── ScreenVideo.tsx              <video> with srcObject
-│   │   │           ├── ScreenPicker.tsx             in-app screens/windows picker
-│   │   │           └── QualityControls.tsx          resolution/fps dropdowns
-│   │   └── shared/              protocol.ts (wire messages), ipc.ts (incl. screen:* IPC)
+│   │   │       ├── App.tsx                 login → lobby → room, hotkeys, tunnel events
+│   │   │       ├── lib/RoomClient.ts       signaling + WebRTC mesh, reconnect/resume,
+│   │   │       │                           audio graph, speaking, screen share
+│   │   │       ├── lib/joinlink.ts         invite-link encode/decode
+│   │   │       ├── lib/sounds.ts           join/leave/mute cues (Web Audio)
+│   │   │       ├── lib/storage.ts          tolerant localStorage helpers
+│   │   │       └── components/             Login, Lobby, Room, PeerTile, SettingsPanel,
+│   │   │                                   ScreenPicker, ScreenVideo, RemoteAudio, …
+│   │   └── shared/              protocol.ts (re-exports server's), ipc.ts
+│   ├── test/                    joinlink tests
 │   ├── electron-builder.yml     packaging config (portable target)
 │   ├── electron.vite.config.ts
 │   └── kootani.config.json      (gitignored) Google creds + defaults
 ├── server/                      signaling server (Node + ws)
-│   └── src/{index.ts,protocol.ts}
+│   ├── src/signaling.ts         THE signaling implementation (used in-app too)
+│   ├── src/protocol.ts          THE wire protocol (imported by the app)
+│   ├── src/index.ts             standalone entry point
+│   └── test/                    signaling tests (real sockets)
 ├── scripts/host.mjs             `npm run host` — server + cloudflared tunnel
 └── docs/                        ARCHITECTURE, TROUBLESHOOTING
 ```
@@ -215,6 +231,7 @@ kootani/
 | `npm run build:app` | Build the app bundle (no packaging) |
 | `npm run dist:app` | Build + package the portable `.exe` |
 | `npm run typecheck` | Typecheck both workspaces |
+| `npm test` | Signaling-server and invite-link tests (`node:test`) |
 
 ---
 
@@ -237,6 +254,9 @@ kootani/
 - ✅ **One-click hosting** — server + tunnel embedded in the app (no `npm run host`).
 - ✅ **Screen sharing** with system/game audio, in-app picker, multiple
   concurrent shares, and live resolution/fps controls.
-- ⏭️ **TURN relay** — add a free relay for the minority of networks where direct
-  peer-to-peer fails.
+- ✅ **Reliability pass (0.4.0)** — seat resume, ICE restart, tunnel auto-restart,
+  hardened server, listen-only fallback; speaking/mute indicators, devices,
+  deafen, hotkeys.
+- ✅ **TURN relay support** — host-side config, shared with guests. Bring free
+  credentials for the minority of networks where direct peer-to-peer fails.
 - ⏸️ **Webcam video** — a per-person camera tile (separate from screen share).

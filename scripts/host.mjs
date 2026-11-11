@@ -51,7 +51,7 @@ function startServer() {
   console.log(`Starting Kootani signaling server on :${PORT} …`);
   const child = spawn(process.execPath, ["--import", "tsx", "server/src/index.ts"], {
     cwd: ROOT,
-    env: { ...process.env, PORT },
+    env: { ...process.env, PORT, HOST: "127.0.0.1" },
     stdio: ["ignore", "inherit", "inherit"],
   });
   return child;
@@ -60,7 +60,9 @@ function startServer() {
 function startTunnel(bin) {
   const child = spawn(
     bin,
-    ["tunnel", "--no-autoupdate", "--url", `http://localhost:${PORT}`],
+    // 127.0.0.1, not localhost (Windows may resolve that to ::1 first);
+    // http2 over TCP/443 traverses more networks than the default QUIC.
+    ["tunnel", "--no-autoupdate", "--protocol", "http2", "--edge-ip-version", "4", "--url", `http://127.0.0.1:${PORT}`],
     { cwd: ROOT, stdio: ["ignore", "pipe", "pipe"] },
   );
 
@@ -75,10 +77,10 @@ function startTunnel(bin) {
         "\n" +
           "════════════════════════════════════════════════════════════\n" +
           "  ✅  Kootani backend is LIVE\n\n" +
-          "  Paste this into the app's “Your server address” field,\n" +
-          "  then click “Host a new room”:\n\n" +
+          "  In the app's lobby open “Advanced: use a custom server address”,\n" +
+          "  paste this and click “Host with this address”:\n\n" +
           `      ${wss}\n\n` +
-          "  After hosting, click “Copy join link” and send it to your\n" +
+          "  Then click “Copy” on the invite link and send it to your\n" +
           "  friends. Keep this window open while you play; Ctrl+C ends it.\n" +
           "════════════════════════════════════════════════════════════\n",
       );

@@ -5,29 +5,61 @@ roughly by how often they bite.
 
 ---
 
+## First step for any problem: the log
+
+Every Kootani writes one diagnostics log: hosting, the tunnel's own output, and
+every connection/WebRTC event. Click **Open logs** (lobby footer, or ⚙ Settings in
+a room) and send the file `kootani.log`.
+
+- Packaged app: `%APPDATA%\Kootani\kootani.log` (dev builds:
+  `%APPDATA%\@kootani\app\kootani.log`).
+- Each launch starts with a `═══ Kootani <version> start` line — check that
+  everyone is on the **same version**.
+- It rotates to `kootani.old.log` at 2 MB, so it never grows without bound.
+
+---
+
+## "Your copy of Kootani is out of date"
+
+The host runs a newer build than you. Builds from **0.4.0** on use a new
+signaling protocol (seat resume, shared TURN), and the host's server turns away
+older ones with this message rather than letting a call half-work. Get the same
+`.exe` as the host. The version is shown in the lobby footer.
+
+---
+
 ## "Host a new room" hangs or errors
 
-One-click hosting starts a local server and opens a Cloudflare tunnel. If it gets
-stuck on "Opening a secure tunnel…" or shows an error:
+One-click hosting starts a local server and opens a Cloudflare tunnel. Progress is
+shown under the button ("Downloading the tunnel helper… 42%", "Opening a secure
+tunnel…"). If it fails:
 
-- **First run downloads `cloudflared`** (~30 MB) from GitHub. On a slow or blocked
-  connection this can stall. Make sure GitHub releases are reachable, then try
-  again (the download is cached after the first success).
-- **Antivirus / SmartScreen may quarantine `cloudflared.exe`.** It's downloaded to
-  `%APPDATA%\kootani\bin\`. Allow it if your AV flags it, then retry.
-- **"The tunnel took too long to come up."** Usually transient — just click **Host
-  a new room** again. If it persists, your network may block outbound QUIC/HTTPS to
-  Cloudflare.
+- **First run downloads `cloudflared`** (~50 MB) from GitHub. A download that makes
+  no progress for 30 s is abandoned with a clear error; partial downloads are
+  never kept, so just try again. GitHub releases must be reachable.
+- **Antivirus / SmartScreen may quarantine `cloudflared.exe`.** It lives in
+  `%APPDATA%\Kootani\bin\`. If it can't be executed, Kootani deletes it and
+  re-downloads on the next attempt; allow it in your AV if this keeps happening.
+- **"The tunnel took too long to come up."** Kootani already retried once. Try
+  again; if it persists, your network may block outbound HTTPS to Cloudflare.
+- The error has an **Open logs** link; the `[cloudflared]` lines say why.
 - Need a server you control instead? Use the lobby's **Advanced → custom server
   address** with `npm run host` (see below).
 
 ---
 
-## "Couldn't reach the signaling server"
+## "Couldn't reach the room"
 
-The app couldn't open a WebSocket to the address it was given. With one-click
-hosting the address is handled for you, so this almost always means the **Advanced
-(custom server address)** path:
+The app kept trying for ~45 s and couldn't open a connection to the address in
+the invite. The usual causes, in order:
+
+1. **The invite is from an old session.** Invite links change every time the host
+   starts hosting. Ask for the current one.
+2. **The host closed Kootani or left the room** (which ends it).
+3. **A brand-new tunnel is still propagating.** Rare after 45 s; click **Try
+   again**.
+
+If you're using the **Advanced (custom server address)** path, also check:
 
 **1. No server is running at that address.**
 - Start one: `npm run host` (server + tunnel), or `npm run dev:server` for local.
@@ -87,13 +119,39 @@ The peer appears and may even show "connected", but silence.
 
 - Check **output volume** for that peer (🔊 slider on their tile) and your OS
   volume / output device.
-- Make sure you actually granted **microphone** permission (Windows Settings →
-  Privacy → Microphone).
-- If the connection dot is stuck on **"connecting"/"failed"**, the two networks
-  can't establish a direct path — typical with strict/CGNAT NAT. Kootani is
-  **STUN-only** today; this needs a **TURN relay**. Add free ExpressTURN
-  credentials to `ICE_SERVERS` in `app/src/renderer/src/lib/RoomClient.ts`,
-  rebuild, and re-share the `.exe`.
+- Check you're not **deafened** (🎧 button / `Ctrl+Shift+D`), and that ⚙
+  Settings → **Speakers / headphones** is the device you're listening on.
+- If **they** see a red banner "Can't use your microphone", they joined
+  listen-only: Windows blocked the mic (Settings → Privacy → Microphone) or no mic
+  is plugged in. Fix it, then click **Try again** in the banner. The ⚙ Settings
+  mic test ("We can hear you") confirms it works.
+- Their tile shows **MUTED**? They're muted on their side.
+- If a tile says **"Can't connect"**, the two networks can't find a direct path —
+  typical with strict/CGNAT NAT. Kootani tries ICE restarts automatically, but
+  this needs a **TURN relay**. See the next section.
+
+---
+
+## Adding a TURN relay (for "Can't connect")
+
+Get free TURN credentials (e.g. ExpressTURN or Metered) and put them in a
+`kootani.config.json` — **only the host needs them**: the host's server hands
+its relay list to everyone who joins.
+
+```json
+{
+  "iceServers": [
+    { "urls": "turn:relay.example.com:3478", "username": "…", "credential": "…" },
+    { "urls": "turns:relay.example.com:443?transport=tcp", "username": "…", "credential": "…" }
+  ]
+}
+```
+
+Either bake it into the build (`app/kootani.config.json`, then `npm run
+dist:app`), or — no rebuild needed — drop it at
+`%APPDATA%\Kootani\kootani.config.json` on the hosting PC and restart Kootani.
+Malformed entries are skipped (the log says which). When a pair is relayed,
+their tile shows `· relay` after the ping.
 
 ---
 
@@ -134,10 +192,17 @@ The video track negotiated but the picture never appears on the other end.
 Kootani uses Windows loopback (`audio: "loopback"`) to capture system audio
 alongside the chosen screen/window, so game sound rides on the share.
 
+- Is **"Share system audio"** ticked in the screen picker? It's remembered
+  between shares.
 - **Sharing a single window?** Loopback captures the whole system mix, not a
   per-window stream — that part is OS-limited. The audio still goes out; just
   expect to hear *everything* coming out of your speakers, not only that one
   app.
+- **Viewers hear their own voices echoed through your share?** Same cause: the
+  mix includes Kootani playing your friends. Untick "Share system audio" when
+  you don't need game sound.
+- Viewers can set your share's volume separately from your voice (🔊 slider on
+  the share, shown on hover).
 - **Output device that bypasses the mixer** (some USB headsets in "exclusive"
   mode, certain virtual audio devices) won't be captured. Switch the OS output
   to your normal speakers/headphones for the duration of the share, or disable
@@ -172,8 +237,8 @@ Stopping (via Kootani's button or Windows' "Stop sharing" overlay) sends a
 `screen:false` notification so the view drops immediately, then renegotiates to
 remove the track. If the view lingers:
 
-- Check the host log (`%APPDATA%\@kootani\app\kootani-host.log`) — both sides
-  log `RoomClient` errors. A failed renegotiation usually points to it.
+- Check `kootani.log` (see the top of this page) on both sides for
+  `RoomClient` errors. A failed renegotiation usually points to it.
 - Leaving and rejoining the room is the surest reset; the receiver's stale
   `PeerView.screenStream` is cleared on `peer-left`.
 
@@ -217,6 +282,18 @@ that value to match.
 
 ---
 
+## "Reconnecting…" banner
+
+Your link to the room's server dropped (Wi-Fi blip, the PC slept, the tunnel
+hiccupped). Kootani reconnects by itself and **reclaims your seat** for up to 60 s,
+so nobody sees you leave — and voice with people you're already connected to
+keeps flowing the whole time, because it never went through the server. Others
+see your tile dimmed with "Reconnecting…".
+
+After ~2 minutes without success it gives up with **Reconnect** in the header.
+
+---
+
 ## The tunnel URL stopped working
 
 Free Cloudflare quick-tunnel URLs are **random per session** and disappear when
@@ -224,3 +301,18 @@ hosting stops — i.e. when the host **leaves the room or quits the app** (or
 `Ctrl+C`s `npm run host`, on the standalone path). If you restarted hosting, the
 old invite link is dead — host again and share the **new** link. (A permanent URL
 would require a paid domain + named tunnel.)
+
+If the tunnel **dies mid-session**, the host's Kootani opens a new one by itself
+(banner: "Your internet tunnel dropped — reopening it"), updates the invite link,
+and tells everyone already in the room the new address over their direct
+connection, so they reconnect without doing anything. Only people who haven't
+joined yet need the new link.
+
+---
+
+## Global hotkeys don't work
+
+`Ctrl+Shift+M` (mute) and `Ctrl+Shift+D` (deafen) are registered while you're in a
+room. If another app already owns a combination, ⚙ Settings marks it
+"unavailable". Close the other app (or change its hotkey) and rejoin. Running two
+Kootani windows on one PC (testing) has the same effect for the second window.
